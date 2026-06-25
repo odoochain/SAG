@@ -1,7 +1,7 @@
 create extension if not exists vector;
 create extension if not exists pg_trgm;
 create extension if not exists unaccent;
-create extension if not exists "uuid-ossp";
+-- uuid-ossp 在 MSYS2/MinGW PG 无 control file 且未被实际使用（所有 id 由应用层生成）；如需用 PG18 内置 gen_random_uuid()
 
 create table if not exists schema_migrations (
   name text primary key,

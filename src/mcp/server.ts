@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { ingestionService } from "../services/ingestion-service.js";
 import { searchService } from "../services/search-service.js";
@@ -192,7 +193,7 @@ export async function startMcpServer(): Promise<void> {
   logger.info("SAG MCP stdio server started");
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   startMcpServer().catch((error: unknown) => {
     logger.error({ error }, "mcp server failed");
     process.exit(1);
