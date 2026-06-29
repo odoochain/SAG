@@ -132,12 +132,12 @@ export class QwenRerankClient implements RerankClient {
 function buildRerankUrl(baseUrl: string): string {
   const base = baseUrl.replace(/\/$/, "");
   if (base.endsWith("/v1")) {
-    return `${base}/reranks`;
+    return `${base}/rerank`;
   }
-  if (base.endsWith("/reranks")) {
+  if (base.endsWith("/rerank") || base.endsWith("/reranks")) {
     return base;
   }
-  return `${base}/v1/reranks`;
+  return `${base}/v1/rerank`;
 }
 
 function eventToRerankDocument(event: EventRecord, candidateCount: number): string {

@@ -42,11 +42,13 @@ export class OpenAICompatibleEmbeddingClient implements EmbeddingClient {
     }
 
     const url = `${settings.embeddingBaseUrl.replace(/\/$/, "")}/embeddings`;
-    const body = {
+    const body: Record<string, unknown> = {
       model: settings.embeddingModel,
-      input: texts,
-      dimensions: settings.embeddingDimensions
+      input: texts
     };
+    if (shouldSendDimensions(settings.embeddingModel)) {
+      body.dimensions = settings.embeddingDimensions;
+    }
     const log = createModelCallLogger({
       kind: "embedding",
       operation: "batchGenerate",
@@ -134,6 +136,12 @@ async function readResponseBody(response: Response): Promise<{ responseText: str
     responseText: typeof responseBody === "string" ? responseBody : JSON.stringify(responseBody),
     responseBody
   };
+}
+
+const FIXED_DIM_MODELS = ["bge-m3", "bge-large", "bge-base", "bge-small"];
+function shouldSendDimensions(model: string): boolean {
+  const lower = model.toLowerCase();
+  return !FIXED_DIM_MODELS.some((m) => lower.includes(m));
 }
 
 export function deterministicEmbedding(text: string, dimensions: number): number[] {
