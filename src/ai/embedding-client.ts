@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { normalizeVector } from "../db/vector.js";
 import { aiSettingsService } from "../services/ai-settings-service.js";
 import { createModelCallLogger } from "../observability/model-call-log.js";
-
 export interface EmbeddingClient {
   generate(text: string): Promise<number[]>;
   batchGenerate(texts: string[]): Promise<number[][]>;

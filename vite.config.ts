@@ -5,7 +5,7 @@ export default defineConfig({
   root: "web",
   plugins: [react()],
   server: {
-    port: 5173,
+    port: 5174,
     proxy: {
       "/api": "http://127.0.0.1:4173",
       "/health": "http://127.0.0.1:4173",
