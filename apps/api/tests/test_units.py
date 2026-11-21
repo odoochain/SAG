@@ -1,5 +1,6 @@
 """快速单元测试：无需网络 / 引擎。"""
 
+import os
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -35,10 +36,60 @@ def test_connector_registry():
 
 def test_model_provider_registry_is_the_public_source_of_truth():
     catalog = model_provider_catalog()
-    assert [provider["id"] for provider in catalog] == ["openai", "anthropic", "gemini"]
+    assert [provider["id"] for provider in catalog] == ["openai", "anthropic", "gemini", "responses"]
     assert all("litellm_prefix" not in provider for provider in catalog)
     assert get_model_provider("openai").route_model("qwen3.6-flash") == "openai/qwen3.6-flash"
     assert get_model_provider("gemini").route_model("gemini/gemini-3.5-flash") == "gemini/gemini-3.5-flash"
+    responses = get_model_provider("responses")
+    assert responses.route_model("gpt-5") == "sag_responses/gpt-5"
+    assert responses.route_model("sag_responses/gpt-5") == "sag_responses/gpt-5"
+    assert responses.protocol == "openai_responses"
+    assert responses.can_reuse_embedding_credentials is False
+
+
+def test_legacy_runtime_default_and_new_setup_preset_reach_engine(monkeypatch):
+    for name in os.environ:
+        if name.upper().startswith(("SAG_LLM_", "SAG_EMBEDDING_")):
+            monkeypatch.delenv(name)
+
+    configured = Settings(_env_file=None)
+    config = build_engine_config(configured)
+    openai_provider = next(provider for provider in model_provider_catalog() if provider["id"] == "openai")
+
+    assert configured.llm_model == "qwen3.6-flash"
+    assert openai_provider["default_model"] == "qwen3.8-flash"
+    assert config.llm.model == "openai/qwen3.6-flash"
+    assert config.embedding.model == "Qwen/Qwen3-Embedding-4B"
+    assert config.embedding.schema_dimensions == 1024
+    assert config.embedding.request_dimensions == 1024
+
+    selected = Settings(_env_file=None, llm_model=openai_provider["default_model"])
+    assert build_engine_config(selected).llm.model == "openai/qwen3.8-flash"
+
+
+@pytest.mark.parametrize("source", ["environment", "initializer"])
+def test_explicit_model_configuration_takes_precedence_over_defaults(source, monkeypatch):
+    overrides = {
+        "llm_provider": "openai",
+        "llm_model": "qwen3.6-flash",
+        "embedding_model": "bge-large-en-v1.5",
+        "embedding_schema_dimensions": 1024,
+        "embedding_request_dimensions": 1024,
+    }
+    for field, value in overrides.items():
+        monkeypatch.setenv(f"SAG_{field.upper()}", str(value))
+    if source == "initializer":
+        monkeypatch.setenv("SAG_LLM_MODEL", "environment-generation-model")
+        monkeypatch.setenv("SAG_EMBEDDING_MODEL", "environment-embedding-model")
+
+    configured = Settings(_env_file=None, **(overrides if source == "initializer" else {}))
+    config = build_engine_config(configured)
+
+    assert configured.llm_model == "qwen3.6-flash"
+    assert config.llm.model == "openai/qwen3.6-flash"
+    assert config.embedding.model == "bge-large-en-v1.5"
+    assert config.embedding.schema_dimensions == 1024
+    assert config.embedding.request_dimensions == 1024
 
 
 def test_build_engine_config_zero_infra():
@@ -53,6 +104,138 @@ def test_build_engine_config_zero_infra():
     assert cfg.llm.max_tokens == settings.llm_max_tokens
     assert cfg.llm.provider == "litellm"
     assert cfg.data_dir == settings.data_dir
+
+
+@pytest.mark.parametrize(
+    ("configured_dimensions", "expected_dimensions"),
+    [(None, 1024), (1024, 1024)],
+)
+def test_engine_config_preserves_embedding_dimensions(configured_dimensions, expected_dimensions):
+    configured = Settings(_env_file=None, embedding_dimensions=configured_dimensions)
+
+    # zleap-sag 0.13.0 把单一 dimensions 拆成 schema/request 两项；旧字段作为
+    # 兼容别名同时喂给两者，故两者都应等于原值（未配置时沿用 1024）。
+    embedding = build_engine_config(configured).embedding
+    assert embedding.schema_dimensions == expected_dimensions
+    assert embedding.request_dimensions == expected_dimensions
+
+
+def test_engine_config_passes_embedding_runtime_limits():
+    configured = Settings(
+        _env_file=None,
+        embedding_concurrency=1,
+        embedding_timeout=180,
+    )
+    cfg = build_engine_config(configured)
+    assert cfg.embedding.timeout == 180
+    assert cfg.runtime_limits.embedding_concurrency == 1
+    assert cfg.runtime_limits.acquire_timeout_seconds == 180.0
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_embedding_dimensions_env_means_unset(blank, monkeypatch):
+    """compose 用 ${SAG_EMBEDDING_DIMENSIONS} 透传，变量未设置时会注入空串。"""
+    monkeypatch.setenv("SAG_EMBEDDING_DIMENSIONS", blank)
+
+    assert Settings(_env_file=None).embedding_dimensions is None
+
+
+def test_embedding_dimensions_env_passes_through(monkeypatch):
+    monkeypatch.setenv("SAG_EMBEDDING_DIMENSIONS", "4096")
+
+    assert Settings(_env_file=None).embedding_dimensions == 4096
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("base_url", "model", "configured_dimensions", "expected_request_dimensions"),
+    [
+        ("https://api.siliconflow.cn/v1", "BAAI/bge-m3", None, None),
+        ("https://api.openai.com/v1", "text-embedding-3-large", None, 1024),
+        ("https://api.siliconflow.cn/v1", "BAAI/bge-m3", 1024, 1024),
+    ],
+)
+async def test_embedding_request_respects_configured_dimensions(
+    base_url,
+    model,
+    configured_dimensions,
+    expected_request_dimensions,
+    monkeypatch,
+):
+    from zleap.sag.core.ai.embedding import EmbeddingClient
+
+    settings = Settings(
+        _env_file=None,
+        embedding_base_url=base_url,
+        embedding_model=model,
+        embedding_dimensions=configured_dimensions,
+    )
+    # zleap-sag 0.13.0 把「建库维度」与「请求参数」拆成两项，SAG 在配置期直接
+    # 表达（见 Settings.effective_embedding_*）：未配置时请求维度跟随 schema，
+    # 已知拒绝该参数的服务商/模型组合则省略。旧版是引擎初始化后改写私有属性，
+    # 在 0.13.0 上既不可用也不需要。
+    config = build_engine_config(settings)
+    embedding = EmbeddingClient(
+        model=config.embedding.model,
+        api_key=config.embedding.api_key,
+        base_url=config.embedding.base_url,
+        schema_dimensions=config.embedding.schema_dimensions,
+        request_dimensions=config.embedding.request_dimensions,
+        max_retries=0,
+    )
+    requests: list[dict] = []
+
+    async def create(**request):
+        requests.append(request)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(embedding.client.embeddings, "create", create)
+
+    await embedding._create_embeddings("test input", label="test")
+
+    assert requests == [
+        {
+            "input": "test input",
+            "model": config.embedding.model,
+            **({"dimensions": expected_request_dimensions} if expected_request_dimensions is not None else {}),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["lancedb", "es", "pgvector", "oceanbase"])
+async def test_unconfigured_embedding_prebuilds_vector_schema_with_legacy_default(provider):
+    from zleap.sag.core.storage.schema import prepare_vector_schema
+
+    class VectorAdapter:
+        def __init__(self) -> None:
+            self.provider = provider
+            self.created: list[tuple[str, int]] = []
+            self.names: set[str] = set()
+
+        async def schema_object_names(self):
+            return frozenset(self.names)
+
+        async def validate_schema_object(self, _name, dimensions):
+            assert dimensions == 1024
+
+        async def create_schema_object(self, name, dimensions):
+            self.created.append((name, dimensions))
+            self.names.add(name)
+
+    config = build_engine_config(Settings(_env_file=None, embedding_dimensions=None))
+    adapter = VectorAdapter()
+
+    scan = await prepare_vector_schema(
+        adapter,
+        storage_mode="normal",
+        dimensions=config.embedding.schema_dimensions,
+        create_missing=True,
+    )
+
+    assert adapter.created
+    assert {dimensions for _, dimensions in adapter.created} == {1024}
+    assert not scan.missing_objects
 
 
 def test_engine_config_presets_structured_output_mode_by_model():
@@ -135,6 +318,28 @@ def test_litellm_policy_preserves_explicit_reasoning_and_allowed_params():
 
     assert request["reasoning_effort"] == "low"
     assert request["allowed_openai_params"] == ["seed", "reasoning_effort"]
+
+
+def test_plain_policy_uses_request_local_settings():
+    """Limiting the request context to Responses sends live options to ordinary models."""
+    from sag_api.generation.responses.routing import request_settings
+    from sag_api.services.chatbot_service import SettingsView
+
+    stock = Settings(
+        _env_file=None, llm_provider="openai", llm_model="plain-test",
+        llm_extra_body={"marker": "old", "enable_thinking": False},
+    )
+    frozen = stock.model_copy(deep=True)
+    stock.llm_extra_body = {"marker": "new", "enable_thinking": True}
+    token = request_settings.set(frozen)
+    try:
+        request = apply_litellm_completion_policy(
+            SettingsView(stock), {"model": "openai/plain-test", "messages": []},
+        )
+        assert request["extra_body"] == {"marker": "old", "enable_thinking": False}
+        assert request["reasoning_effort"] == "none"
+    finally:
+        request_settings.reset(token)
 
 
 @pytest.mark.parametrize("tool_choice", ["none", "required", None])
@@ -266,6 +471,7 @@ def test_document_output_redacts_database_details():
         "content_type": "text/markdown",
         "size_bytes": 12,
         "status": DocumentStatus.FAILED,
+        "has_publication": False,
         "chunk_count": 0,
         "event_count": 0,
         "progress": 5,
@@ -304,6 +510,7 @@ def test_document_output_marks_octx_documents_without_original_files():
         "content_type": "application/pdf",
         "size_bytes": 12,
         "status": DocumentStatus.READY,
+        "has_publication": True,
         "chunk_count": 1,
         "event_count": 1,
         "progress": 100,
@@ -675,14 +882,13 @@ def test_agent_name_is_injected_into_prompt():
     assert "sag" not in system.lower()
 
 
-def test_document_delete_keeps_v1_success_contract():
+def test_document_delete_exposes_the_durable_cleanup_job_contract():
     from sag_api.main import app
 
     operation = app.openapi()["paths"][
         "/api/v1/sources/{source_id}/documents/{document_id}"
     ]["delete"]
 
-    assert "200" in operation["responses"]
-    assert "202" not in operation["responses"]
-    schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
-    assert schema["$ref"].endswith("/Ok")
+    assert "202" in operation["responses"]
+    schema = operation["responses"]["202"]["content"]["application/json"]["schema"]
+    assert schema["$ref"].endswith("/JobOut")

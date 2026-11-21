@@ -31,6 +31,7 @@ const MAP: Record<
   pausing: { variant: "secondary", icon: Loader2, spin: true },
   paused: { variant: "outline", icon: Pause },
   deleting: { variant: "secondary", icon: Trash2, spin: true },
+  "delete-paused": { variant: "outline", icon: Pause },
   delete_failed: { variant: "destructive", icon: XCircle },
   ready: { variant: "success", icon: Check },
   failed: { variant: "destructive", icon: XCircle },
@@ -43,14 +44,14 @@ export function DocStatusBadge({ status }: { status: DocumentStatus }) {
   return <DocumentActivityBadge phase={status} />;
 }
 
-export function DocumentActivityBadge({ phase }: { phase: DocumentActivityPhase }) {
+export function DocumentActivityBadge({ phase, label }: { phase: DocumentActivityPhase; label?: string }) {
   const t = useTranslations("DocumentStatus");
   const c = MAP[phase] ?? MAP.pending;
   const Icon = c.icon;
   return (
     <Badge variant={c.variant}>
       <Icon className={cn("size-3", c.spin && "animate-spin")} />
-      {t(documentActivityLabelKey(phase))}
+      {label ?? t(documentActivityLabelKey(phase))}
     </Badge>
   );
 }

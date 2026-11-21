@@ -5,6 +5,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, computed_field, field_validator
 
 from sag_api.enums import DocumentStatus
+from sag_api.schemas.job import JobOut
 
 
 class MessageItem(BaseModel):
@@ -23,18 +24,28 @@ class IngestRequest(BaseModel):
     messages: list[MessageItem] | None = Field(default=None)
 
 
+class DocumentReprocessRequest(BaseModel):
+    confirmation_token: str | None = Field(default=None, min_length=32, max_length=128)
+
+
 class DocumentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
     source_id: str
+    job_id: str | None = None
     filename: str
     content_type: str
     size_bytes: int
     status: DocumentStatus
+    has_publication: bool
+    deletion_job: JobOut | None = None
     chunk_count: int
     event_count: int
     progress: int
+    processing_stage: str | None = None
+    processed_chunks: int | None = None
+    total_chunks: int | None = None
     token_usage: int
     error: str | None
     error_layer: str | None = None

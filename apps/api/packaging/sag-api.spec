@@ -9,7 +9,10 @@ from PyInstaller.utils.hooks import (
 
 project_root = Path(SPECPATH).parent
 
-datas = []
+# Responses configuration reads this policy file at runtime beside its module.
+datas = [
+    (str(project_root / "sag_api" / "core" / "responses_thinking.json"), "sag_api/core"),
+]
 binaries = []
 hiddenimports = [
     "aiosqlite",
@@ -44,6 +47,7 @@ for package in (
 # OpenAI, Anthropic, and Gemini, so freezing every LiteLLM module would pull
 # unrelated server/CLI dependencies into the desktop sidecar.
 datas += collect_data_files("litellm")
+datas += collect_data_files("certifi")
 for package in (
     "litellm.litellm_core_utils",
     "litellm.types",
@@ -90,7 +94,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(project_root / "packaging" / "hooks" / "rthook_certificates.py")],
     excludes=[
         "onnxruntime.backend",
         "onnxruntime.quantization",

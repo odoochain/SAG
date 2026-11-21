@@ -8,6 +8,8 @@ import { AccountSettings } from "@/components/features/account-settings";
 import { AgentSettingsCard } from "@/components/features/agent-settings-card";
 import { AppearanceSettings } from "@/components/features/appearance-settings";
 import { DiagnosticsSettings } from "@/components/features/diagnostics-settings";
+import { ClientAccessSettings } from "@/components/features/client-access-settings";
+import { DshServiceSettings } from "@/components/features/dsh-service-settings";
 import { KnowledgeConfigForm } from "@/components/features/knowledge-config-form";
 import { McpSettingsCard } from "@/components/features/mcp-settings-card";
 import { McpServiceSettings } from "@/components/features/mcp-service-settings";
@@ -113,18 +115,14 @@ function SettingsPageContent() {
         </TabsContent>
 
         <TabsContent value="knowledge" className="m-0 animate-fade-in">
-          <div
-            data-settings-section="document-processing"
-            tabIndex={-1}
-            className="scroll-mt-6 outline-none"
-          >
-            <KnowledgeConfigForm />
-          </div>
+          <KnowledgeConfigForm />
         </TabsContent>
 
         <TabsContent value="integrations" className="m-0 animate-fade-in">
           <div className="flex flex-col gap-6">
             <McpSettingsCard />
+            <DshServiceSettings />
+            <ClientAccessSettings />
             <McpServiceSettings />
           </div>
         </TabsContent>

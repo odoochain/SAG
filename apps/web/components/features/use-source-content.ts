@@ -5,6 +5,7 @@ import { useTranslations } from "next-intl";
 
 import { api, ApiError } from "@/lib/api";
 import { getDiagnosticsStore } from "@/lib/diagnostics";
+import { notifyDocumentChanged } from "@/lib/document-events";
 import {
   beginDocumentMutation,
   deriveDocumentActivity,
@@ -272,7 +273,7 @@ export function useSourceContent(sourceId: string, active = true) {
     };
   }, [active, pollJobs, refresh]);
 
-  const mutateDocument = React.useCallback(async (document: Doc, action: DocumentAction) => {
+  const mutateDocument = React.useCallback(async (document: Doc, action: DocumentAction, confirmationToken?: string) => {
     const mutationSourceId = sourceId;
     refreshRequestRef.current += 1;
     const mutation = beginDocumentMutation(document, action);
@@ -280,9 +281,9 @@ export function useSourceContent(sourceId: string, active = true) {
     try {
       let job: BackgroundJob | null = null;
       if (action === "delete") {
-        await api.deleteDocument(mutationSourceId, document.id);
+        job = await api.deleteDocument(mutationSourceId, document.id);
       } else if (action === "reprocess") {
-        job = await api.reprocessDocument(mutationSourceId, document.id);
+        job = await api.reprocessDocument(mutationSourceId, document.id, confirmationToken);
       } else if (action === "pause") {
         job = await api.pauseDocument(mutationSourceId, document.id);
       } else {
@@ -299,6 +300,7 @@ export function useSourceContent(sourceId: string, active = true) {
       }
       if (!isCurrentDocumentSource(mutationSourceId, sourceIdRef.current)) return false;
       await refresh({ background: true });
+      notifyDocumentChanged(mutationSourceId, document.id);
       return true;
     } catch (reason) {
       if (!isCurrentDocumentSource(mutationSourceId, sourceIdRef.current)) return false;
@@ -308,6 +310,7 @@ export function useSourceContent(sourceId: string, active = true) {
         return next;
       });
       await refresh({ background: true });
+      notifyDocumentChanged(mutationSourceId, document.id);
       throw reason;
     }
   }, [refresh, sourceId]);

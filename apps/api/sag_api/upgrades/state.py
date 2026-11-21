@@ -24,6 +24,7 @@ class BootstrapState:
     source_version: str | None
     target_version: str
     choice: StorageChoice | None = None
+    rebuild_confirmed: bool = False
     actor_user_id: str | None = None
     adapter_id: str | None = None
     stage: str | None = None
@@ -52,8 +53,12 @@ class BootstrapStateStore:
             return None
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("expected an object")
             if payload.get("schema_version") != BOOTSTRAP_SCHEMA_VERSION:
                 raise ValueError("unsupported schema version")
+            if not isinstance(payload.get("rebuild_confirmed", False), bool):
+                raise ValueError("invalid rebuild confirmation")
             payload["phase"] = StorageBootstrapPhase(payload["phase"])
             if payload.get("choice") is not None:
                 payload["choice"] = StorageChoice(payload["choice"])

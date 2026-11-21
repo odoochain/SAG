@@ -39,34 +39,50 @@ npm run dev
 
 ## 用户下载与更新
 
-正式安装包统一发布在 [`Zleap-AI/SAG` Releases](https://github.com/Zleap-AI/SAG/releases/latest)：
+正式安装包统一发布在 [`Zleap-AI/SAG` Releases](https://github.com/Zleap-AI/SAG/releases)：
 
-- macOS Apple Silicon：DMG 用于安装，ZIP 与 `latest-mac.yml` 用于自动更新；
-- Windows x64：暂不签名的 NSIS EXE 用于安装，`latest.yml` 与 blockmap 用于自动更新；Windows 可能显示“未知发布者”提示；
+- macOS Apple Silicon：DMG 用于安装，ZIP 与 `latest-mac.yml` 用于应用内更新；
+- Windows x64：暂不签名的 NSIS EXE 用于安装，`latest.yml` 与 blockmap 用于应用内更新；Windows 可能显示“未知发布者”提示；
 - `SHA256SUMS.txt` 用于校验下载完整性。
 
-已安装客户端默认跟随 GitHub Releases 的 `latest` 稳定通道。Release 必须是非草稿正式版本；草稿和失败的流水线不会被客户端发现。
+客户端后台检查更新；用户选择“下载更新”后才下载，完成后再次选择“重启并安装”才安装。普通退出、稍后处理或重启应用都不会自动安装。旧客户端通过兼容过渡版获得此能力。
 
-## 一条命令发布到 public
+## 正式发布流程
 
-正式发布只能从 `Zleap-AI/SAG` 的独立公开 clone 根目录、干净且已合并完成的 `main` 分支执行。该 clone 不得添加内部仓库 remote，也不得包含内部 Git 历史：
+桌面版正式发布分为两个阶段：先在 PR 中准备并审核版本元数据，PR 合入 `main` 后，再从 `Zleap-AI/SAG` 的干净 `main` 分支创建并推送发布标签。请仅使用官方公开仓库，不要包含内部 Git 历史。
+
+在版本 PR 分支上输入计划发布的下一个稳定版本号：
 
 ```bash
-make release-dry-run VERSION=1.4.0
-make release VERSION=1.4.0
+printf "请输入下一个稳定版本号: "
+read -r VERSION
+node scripts/release-public.mjs --prepare "$VERSION"
 ```
 
-`scripts/release-public.mjs` 会：
+脚本会更新 Desktop/Web/API 版本、lockfile、README 版本徽章和 `CHANGELOG.md` 发布记录。它不会暂存或提交文件，也不会推送变更或创建标签；请按常规 PR 流程审核并合入这些元数据变更。
 
-1. 校验当前分支、干净工作区、严格递增的稳定 SemVer，以及 fetch/push remote 是否都指向 `Zleap-AI/SAG`；
-2. 拉取并确认本地 `main` 包含 `origin/main`，且两者根提交完全一致，阻止内部或其他无关历史进入公开仓库；
-3. 同步 Desktop/Web/API 运行时版本及 lockfile，更新 README 徽章，将 `Unreleased` 归档为本次版本；
-4. 创建 `release: vX.Y.Z` 提交和不可变注解标签；
-5. 原子推送 `main + vX.Y.Z` 到公开仓库的 `origin`。任一引用推送失败时，两者都不会在远端生效。
+PR 合入后，使用已同步到最新状态的干净克隆，并输入与 PR 中准备的版本号相同的版本：
 
-标签随后触发 `.github/workflows/desktop-release.yml`。流水线复用完整 CI 门禁，在 `macos-15` ARM64 与 `windows-2025` x64 原生 runner 并行构建；macOS 必须签名并公证成功，Windows 明确生成无签名安装包，且两个平台更新元数据和校验文件齐全时，才创建公开 GitHub Release。
+```bash
+git checkout main
+git pull --ff-only
+printf "请输入已合入的版本号: "
+read -r VERSION
+make release-dry-run VERSION="$VERSION"
+make release VERSION="$VERSION"
+```
 
-发布脚本不会在本地构建或上传二进制。推送失败时，本地发布提交与标签会保留，排查后可重试；不要移动或复用已经公开的标签。
+仅创建标签的发布脚本会检查干净的 `main` 工作区和已准备的版本元数据，然后创建注解版本标签，并将标签指向公开仓库 `origin/main` 当前提交。标签会触发 `.github/workflows/desktop-release.yml`。流水线在原生 `macos-15` ARM64 和 `windows-2025` x64 runner 上构建。版本校验通过后，两个平台构建与质量检查并行；只有完整质量检查通过、macOS 签名与公证成功，并且两个平台的更新元数据和校验文件齐全后，才会创建公开 GitHub Release。质量检查失败仍会阻止发布，但此时已经启动的构建可能继续消耗 runner 时间。
+
+脚本不会在本地构建或上传二进制。推送标签失败时，请先排查原因再重试；已经公开的标签不可移动或复用。
+
+### 发布耗时与缓存
+
+`.github/workflows/desktop-dependency-cache.yml` 在 `main` 上的依赖或发布配置变化后，使用与正式构建相同的 macOS/Windows runner 预热 npm 与 uv 下载缓存。两条流水线共用 `.github/actions/setup-desktop-build/action.yml`，保持工具链和缓存键一致。预热不构建安装包、不使用签名凭据，也不发布版本。
+
+GitHub 不允许不同标签相互读取缓存，但标签可以读取默认分支的缓存；因此只在版本标签中保存缓存，不能让下一次版本发布命中它。版本 PR 合入后，让对应的 Desktop Dependency Cache 完成再推标签，可提高命中率；缓存过期时也可在 `main` 手动运行预热。预热失败、尚未完成或缓存缺失都不阻止发布，正式构建仍执行 `npm ci` 和 `uv sync --frozen --extra desktop`，只会回到下载依赖的路径。预热会额外使用两台 runner，目标是缩短发布等待，不保证减少总 runner 用量。
+
+Actions 将 Electron 编译、Next.js 构建、Python 冻结、资源组装分别列为步骤，便于比较耗时。macOS 的签名和公证仍由 electron-builder 管理，不跳过签名、公证、更新元数据或安装包校验。首轮优化的测量基线与验收方法见 [桌面发布性能记录](../../docs/desktop-release-performance.md)。
 
 ## GitHub 发布环境
 
@@ -132,7 +148,7 @@ npm run dist:win
 
 产物位于 `apps/desktop/release/`：
 
-- macOS：DMG 用于安装，ZIP 用于自动更新；
+- macOS：DMG 用于安装，ZIP 用于应用内更新；
 - Windows：NSIS 安装器及其更新元数据。
 
 只验证应用目录、不生成安装器时，可运行：
@@ -172,11 +188,35 @@ macOS 签名凭据只注入 electron-builder 的最终签名与公证步骤，�
 
 应用更新不会覆盖此目录；Windows 卸载器也配置为默认保留用户数据。
 
+### 本地服务生命周期
+
+桌面主进程管理一组 Web/API 服务，启动、停止和重试互斥。启动中退出会取消健康探测并等待清理；任一服务异常退出时，先清理同组服务，再显示“退出 / 重试”。重试沿用已保存的 Web 端口，保留同一浏览器 origin 下的登录和本地设置；不会自动反复重启服务或替用户重跑任务。
+
+退出或“重启并安装”前，会检查在途请求、排队/执行中的文档任务、OCTX 导入导出及存储重建。有未完成任务或暂时无法确认状态时，默认取消，用户可以明确选择中断。Windows 关闭主窗口也经过此检查；macOS 关闭窗口仍按原行为保留后台运行。开发模式的 Web/API 由开发启动脚本管理。
+
+打包 API 在原监听端口额外挂载私有控制入口，仅接受 loopback 与每次启动随机令牌；普通 Web 部署不挂载该入口，令牌不发送给渲染页面或继承给 worker。退出先请求 Uvicorn 执行现有 lifespan 清理，最多等待 20 秒，再强制结束进程树；Web 最多等待 5 秒。macOS 使用独立 API 进程组清理残留 worker，Windows 使用不继承句柄的 Job Object 将 worker 绑定到 API 生命周期。清理失败时阻止启动替代服务；更新安装器仅在清理完成后启动，安装失败会恢复本地服务。
+
+完整安装包需在两平台验证启动中退出、带任务退出、崩溃重试、后台进程回收、手动安装更新和用户数据保留。
+
 ## 更新约束
 
 桌面版采用整包版本和整包更新：Electron、Next.js、Python API 及其原生依赖使用同一个 `apps/desktop/package.json` 版本发布。不要分别更新 Web 或 Python sidecar，否则无法保证接口和数据迁移兼容。
 
-public 正式构建使用 GitHub provider，并把安装包、ZIP/EXE 更新载荷、blockmap、`latest-mac.yml` 与 `latest.yml` 发布在同一个非草稿 Release。electron-builder 在安装包内生成 `app-update.yml`，客户端据此发现后续稳定版本；不要把更新地址固定到某个版本标签的下载目录。
+public 正式构建将 `SAG_UPDATE_GITHUB_REPOSITORY` 转换为 generic provider，地址为 `https://github.com/<owner>/<repo>/releases/download/desktop-manual-updates`。electron-builder 将此配置写入安装包的 `app-update.yml`。独立通道的 `latest-mac.yml` 和 `latest.yml` 只存版本、安装包的绝对下载地址、大小和 SHA512；实际安装包、blockmap 和校验文件仍在不可覆盖的 `vX.Y.Z` Release 中。
+
+`desktop-manual-updates` 是专用的可更新元数据预发布，不是安装包版本，也不能设置为 GitHub latest。旧版 GitHub provider 继续读取最后的兼容过渡版；新客户端读取独立通道。这样离线用户跳过中间发布，也不会自动安装移除迁移能力的版本。
+
+### 两阶段发布
+
+1. 先发布包含手动更新、通道隔离和旧数据重建确认保护的兼容过渡版本，`apps/desktop/release-policy.json` 的 `legacyBridge` 为 `true`。发布脚本将其标记为旧通道 latest，并创建独立元数据通道与 `legacy-bridge.json` 标记。旧客户端可能自动安装此过渡版。过渡版保留既有迁移兼容能力，但 Windows 隐式重建及历史未确认重建均须重新获得用户确认，不能在启动时清理知识记录。
+2. 过渡版在 Windows/macOS 验收后，再合入移除旧数据迁移的后续改动，将 `legacyBridge` 设为 `false`。后续所有正式版本均使用 `--latest=false`，只更新独立通道元数据，不移动旧通道 latest。
+3. 发布脚本在缺少过渡标记、重复发布过渡版或发现旧 latest 被移动时停止。不要人工将后续版本设为 latest，也不要把两阶段改动合并成一个过渡发行包。
+
+独立通道是唯一允许覆盖的元数据 Release，版本安装包不覆盖。元数据替换不是原子的：脚本在覆盖前备份旧元数据，失败时重试并尝试恢复，仍然失败则令流水线报错。中断期间检查更新可能暂时不可用，已安装应用不受影响。若版本发布成功但元数据上传失败，使用原构建资产重试发布脚本；它会比对已发布的 SHA256SUMS，一致才恢复元数据发布，差异则停止。不能删除或重建版本标签。如果 GitHub 留下了未完成的草稿，先检查并补齐该草稿资产与校验文件，再恢复发布；脚本不会擅自覆盖草稿。GitHub Releases 列表用于人工下载安装，`/releases/latest` 有意停留在兼容过渡版。
+
+### 更新验收
+
+在两个平台验证：拒绝下载时无包下载；下载完成后退出和重新启动不安装；仅点击“重启并安装”才升级；反复点击和定时检查不覆盖当前下载；旧客户端仅发现过渡版；新客户端能从独立通道发现后续版本。单元测试和类型检查不能代替安装包验收。
 
 备用自托管场景可以设置 `SAG_UPDATE_BASE_URL` 使用 generic provider，但必须自行保证同一稳定 URL 始终提供最新元数据和对应载荷。未配置 provider 的开发/本地产物不会生成更新配置，也不会检查更新。
 
@@ -196,4 +236,4 @@ npm run prepare:release
 - 文档导入、搜索、对话、探索模式和 MCP；
 - 应用退出后两个本地服务均结束；
 - 覆盖升级保留用户数据；
-- macOS 签名与 notarization、Windows “未知发布者”安装流程，以及两个平台的自动更新。
+- macOS 签名与 notarization、Windows “未知发布者”安装流程，以及两个平台分别确认下载、安装的更新流程。

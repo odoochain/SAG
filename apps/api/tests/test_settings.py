@@ -1,8 +1,11 @@
 """模型配置端点：GET 脱敏、PUT 持久化+生效、密钥保留、非法值 422、连接测试（离线）。
 
 全程离线且**不留全局副作用**：`finally` 删除 settings 表行 + 还原被改的 `settings` 单例字段，
-避免跨测试泄漏（端点会就地覆盖进程级单例）。连接测试只验证「未配置」分支（无网络）。
+避免跨测试泄漏（端点会就地覆盖进程级单例）。连接测试仅替换外部模型传输（无网络）。
 """
+
+import logging
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
@@ -16,6 +19,7 @@ _RESTORE = (
     "llm_temperature",
     "llm_timeout_ms",
     "llm_max_retries",
+    "llm_structured_output_mode",
     "search_strategy",
     "document_chunk_max_tokens",
     "document_chunk_mode",
@@ -26,6 +30,8 @@ _RESTORE = (
     "embedding_base_url",
     "embedding_api_key",
     "embedding_dimensions",
+    "embedding_schema_dimensions",
+    "embedding_request_dimensions",
     "document_parser",
     "mineru_provider",
     "mineru_base_url",
@@ -70,6 +76,24 @@ def test_chinese_query_segmentation_can_be_disabled(monkeypatch):
     assert Settings(_env_file=None).search_chinese_segmentation_enabled is False
 
 
+def test_agent_tool_timeout_defaults_to_30s_and_accepts_env(monkeypatch):
+    monkeypatch.delenv("SAG_AGENT_TOOL_TIMEOUT_SECONDS", raising=False)
+    assert Settings(_env_file=None).agent_tool_timeout_seconds == 30.0
+    monkeypatch.setenv("SAG_AGENT_TOOL_TIMEOUT_SECONDS", "300")
+    assert Settings(_env_file=None).agent_tool_timeout_seconds == 300.0
+
+
+def test_runtime_factory_applies_agent_tool_timeout_seconds():
+    from sag_api.runtime import _RuntimeFactory
+
+    factory = _RuntimeFactory(
+        Settings(_env_file=None, agent_tool_timeout_seconds=300),
+        session_factory=None,
+    )
+    runtime = factory.create_agent_runtime()
+    assert runtime.config.tool_timeout_seconds == 300.0
+
+
 def test_timezone_defaults_to_beijing_and_rejects_invalid(monkeypatch):
     monkeypatch.delenv("SAG_TIMEZONE", raising=False)
     assert Settings(_env_file=None).timezone == "Asia/Shanghai"
@@ -78,6 +102,38 @@ def test_timezone_defaults_to_beijing_and_rejects_invalid(monkeypatch):
     monkeypatch.setenv("SAG_TIMEZONE", "Mars/Olympus")
     with pytest.raises(ValueError):
         Settings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("HTTP://SAG.EXAMPLE.COM:18080/", "http://sag.example.com:18080"),
+        ("https://sag.example.com/local/sag/", "https://sag.example.com/local/sag"),
+        ("http://[::1]:18080/", "http://[::1]:18080"),
+    ],
+)
+def test_dsh_public_url_is_canonical_http_origin_or_proxy_base(monkeypatch, raw, expected):
+    monkeypatch.delenv("SAG_DSH_PUBLIC_URL", raising=False)
+
+    assert Settings(_env_file=None, dsh_public_url=raw).dsh_public_url == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "sag.example.com:8000",
+        "ftp://sag.example.com",
+        "http://user:secret@sag.example.com",
+        "http://sag.example.com?next=evil",
+        "http://sag.example.com/#fragment",
+        "http://sag.example.com/prefix//nested",
+    ],
+)
+def test_dsh_public_url_rejects_noncanonical_or_credential_bearing_values(monkeypatch, raw):
+    monkeypatch.delenv("SAG_DSH_PUBLIC_URL", raising=False)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, dsh_public_url=raw)
 
 
 def test_provider_base_urls_default_to_302_china_endpoint(monkeypatch):
@@ -192,6 +248,49 @@ def test_database_model_config_overrides_environment_default():
     assert configured.llm_model == "database-model"
 
 
+@pytest.mark.parametrize(
+    "overrides,model,url,schema_dimensions,request_dimensions",
+    [
+        (
+            {"embedding_dimensions": 1024, "embedding_schema_dimensions": 1024, "embedding_request_dimensions": 1024},
+            "embedding-model", "https://embedding.invalid/v1", 1024, 1024,
+        ),
+        (
+            {"embedding_dimensions": None, "embedding_schema_dimensions": None, "embedding_request_dimensions": None},
+            "embedding-model", "https://embedding.invalid/v1", 1024, 1024,
+        ),
+        ({"llm_model": "saved-generation"}, "embedding-model", "https://embedding.invalid/v1", 16, 16),
+        (
+            {"embedding_dimensions": None, "embedding_schema_dimensions": None, "embedding_request_dimensions": None},
+            "BAAI/bge-m3", "https://api.siliconflow.cn/v1", 1024, None,
+        ),
+        ({"embedding_dimensions": 1024}, "embedding-model", "https://embedding.invalid/v1", 16, 16),
+        ({"embedding_dimensions": None}, "embedding-model", "https://embedding.invalid/v1", 16, 16),
+    ],
+)
+def test_saved_embedding_dimensions_override_split_environment(
+    overrides, model, url, schema_dimensions, request_dimensions,
+):
+    from sag_api.services.settings_service import apply_overrides
+
+    configured = Settings(
+        _env_file=None,
+        embedding_model=model,
+        embedding_base_url=url,
+        embedding_dimensions=16,
+        embedding_schema_dimensions=16,
+        embedding_request_dimensions=16,
+    )
+
+    apply_overrides(configured, overrides)
+
+    assert configured.effective_embedding_schema_dimensions == schema_dimensions
+    assert configured.effective_embedding_request_dimensions == request_dimensions
+    if "embedding_schema_dimensions" in overrides:
+        assert configured.embedding_schema_dimensions == overrides["embedding_schema_dimensions"]
+        assert configured.embedding_request_dimensions == overrides["embedding_request_dimensions"]
+
+
 def test_explicit_llm_lock_preserves_environment_values():
     from sag_api.services.settings_service import apply_overrides
 
@@ -268,12 +367,148 @@ async def _register(c, email):
     return {"Authorization": f"Bearer {r.json()['access_token']}"}
 
 
+@asynccontextmanager
+async def _self_hosted_model_config_client(monkeypatch):
+    from sqlalchemy import delete
+
+    from sag_api.core.db import SessionLocal, init_db
+    from sag_api.db.models import Setting, User
+    from sag_api.main import app
+    from sag_api.services.settings_service import save_model_config
+
+    snapshot = {key: getattr(settings, key) for key in _RESTORE}
+    monkeypatch.setattr(settings, "mineru_tier", "flash")
+    monkeypatch.setattr(settings, "mineru_allow_private_base_url", True)
+    await init_db()
+    try:
+        async with SessionLocal() as session:
+            await save_model_config(
+                session,
+                {
+                    "llm_provider": "openai",
+                    "llm_base_url": "https://llm.example/v1",
+                    "llm_api_key": "schema-regression-key",
+                    "llm_model": "test-model",
+                    "llm_temperature": 0.2,
+                    "mineru_provider": "self_hosted",
+                    "mineru_base_url": "http://127.0.0.1:18000",
+                },
+            )
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client:
+                headers = await _register(client, "self-hosted-modelcfg@t.com")
+                response = await client.get("/api/v1/system/model-config", headers=headers)
+                assert response.status_code == 200, response.text
+                config = response.json()
+                # Match the settings form's currentPatch(), including its empty URL conversion.
+                payload = {
+                    key: config[key]
+                    for key in (
+                        "llm_provider", "llm_base_url", "llm_model", "llm_temperature",
+                        "llm_max_tokens", "llm_timeout_ms", "llm_max_retries", "llm_context_window",
+                        "embedding_model", "embedding_base_url", "embedding_dimensions",
+                        "document_parser", "mineru_provider", "mineru_base_url", "mineru_version",
+                        "mineru_official_model",
+                    )
+                }
+                payload["embedding_base_url"] = config["embedding_base_url"] or ""
+                payload["llm_temperature"] = 0.7
+                yield client, headers, config, payload
+    finally:
+        async with SessionLocal() as session:
+            await session.execute(delete(Setting).where(Setting.scope == "global", Setting.key == "model_config"))
+            await session.execute(delete(User).where(User.email == "self-hosted-modelcfg@t.com"))
+            await session.commit()
+        for key, value in snapshot.items():
+            setattr(settings, key, value)
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_model_config_form_save_preserves_deployment_settings(monkeypatch):
+    from sqlalchemy import select
+
+    from sag_api.core.db import SessionLocal
+    from sag_api.db.models import Setting
+    from sag_api.main import app
+
+    async with _self_hosted_model_config_client(monkeypatch) as (client, headers, config, payload):
+        assert config["mineru_provider"] == "self_hosted"
+        assert config["mineru_base_url"] == "http://127.0.0.1:18000"
+        assert config["llm_temperature"] == 0.2
+
+        response = await client.put("/api/v1/system/model-config", headers=headers, json=payload)
+
+        assert response.status_code == 200, response.text
+        saved = (await client.get("/api/v1/system/model-config", headers=headers)).json()
+        assert saved["llm_temperature"] == 0.7
+        assert saved["mineru_provider"] == "self_hosted"
+        assert saved["mineru_base_url"] == "http://127.0.0.1:18000"
+        async with SessionLocal() as session:
+            row = await session.scalar(select(Setting).where(Setting.scope == "global", Setting.key == "model_config"))
+            assert row is not None
+            assert row.value["llm_temperature"] == 0.7
+            assert row.value["mineru_provider"] == "self_hosted"
+        for active in (settings, app.state.knowledge_runtime._settings):
+            assert active.llm_temperature == 0.7
+            assert active.mineru_provider == "self_hosted"
+            assert active.mineru_tier == "flash"
+            assert active.mineru_allow_private_base_url is True
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_model_config_form_test_uses_draft_without_saving(monkeypatch):
+    from sqlalchemy import select
+
+    from sag_api.core.db import SessionLocal
+    from sag_api.db.models import Setting
+    from sag_api.main import app
+
+    observed: dict = {}
+
+    async def fake_completion(**request):
+        if "response_format" not in request:
+            observed.update(request)
+        return {
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{"index": 0, "message": {"role": "assistant",
+                         "content": '{"ok": true}' if "response_format" in request else "pong"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    monkeypatch.setattr("sag_api.generation.llm._litellm_completion", fake_completion)
+    async with _self_hosted_model_config_client(monkeypatch) as (client, headers, config, payload):
+        runtime_before = app.state.knowledge_runtime._settings.model_dump()
+        settings_before = settings.model_dump()
+        response = await client.post("/api/v1/system/model-config/test", headers=headers, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "message": "连接成功 · openai / test-model",
+                                   "completion": {"ok": True}, "structured": {"ok": True, "mode": "auto"}}
+        assert observed["model"] == "openai/test-model"
+        assert observed["api_key"] == "schema-regression-key"
+        assert observed["api_base"] == "https://llm.example/v1"
+        assert observed["temperature"] == 0.7
+        assert observed["messages"] == [{"role": "user", "content": "ping"}]
+        assert (await client.get("/api/v1/system/model-config", headers=headers)).json() == config
+        assert settings.model_dump() == settings_before
+        assert app.state.knowledge_runtime._settings.model_dump() == runtime_before
+        async with SessionLocal() as session:
+            row = await session.scalar(select(Setting).where(Setting.scope == "global", Setting.key == "model_config"))
+            assert row is not None
+            assert row.value["llm_temperature"] == 0.2
+            assert row.value["mineru_provider"] == "self_hosted"
+
+
 @pytest.mark.asyncio
 async def test_model_config_crud_masking_and_test(monkeypatch: pytest.MonkeyPatch):
     from sqlalchemy import delete, select
 
     from sag_api.core.db import SessionLocal
-    from sag_api.db.models import Document, Setting, Source
+    from sag_api.db.models import Document, Setting, Source, User
     from sag_api.enums import DocumentStatus
     from sag_api.main import app
 
@@ -325,8 +560,10 @@ async def test_model_config_crud_masking_and_test(monkeypatch: pytest.MonkeyPatc
                     "openai",
                     "anthropic",
                     "gemini",
+                    "responses",
                 ]
-                assert providers[0]["default_model"] == body["llm_model"]
+                assert providers[0]["default_model"] == "qwen3.8-flash"
+                assert body["llm_model"] == "qwen3.6-flash"  # Existing implicit runtime default remains stable.
                 assert "litellm_prefix" not in providers[0]
 
                 # 连接测试（未配置）→ 立即 ok False，无网络
@@ -344,7 +581,11 @@ async def test_model_config_crud_masking_and_test(monkeypatch: pytest.MonkeyPatc
                     observed["key"] = client._settings.llm_api_key
                     return "pong"
 
+                async def fake_structured(_client):
+                    return None
+
                 monkeypatch.setattr(LLMClient, "complete", fake_complete)
+                monkeypatch.setattr(LLMClient, "probe_structured", fake_structured)
                 draft = await c.post(
                     "/api/v1/system/model-config/test",
                     headers=A,
@@ -359,6 +600,7 @@ async def test_model_config_crud_masking_and_test(monkeypatch: pytest.MonkeyPatc
                 assert draft.json() == {
                     "ok": True,
                     "message": "连接成功 · gemini / gemini-3.5-flash",
+                    "completion": {"ok": True}, "structured": {"ok": True, "mode": "auto"},
                 }
                 assert observed == {
                     "provider": "gemini",
@@ -584,6 +826,130 @@ async def test_model_config_crud_masking_and_test(monkeypatch: pytest.MonkeyPatc
                     Setting.key.in_(["model_config", "system_preferences"]),
                 )
             )
+            await s.execute(delete(User).where(User.email == "modelcfg@t.com"))
             await s.commit()
         for key, value in snapshot.items():
             setattr(settings, key, value)
+
+
+def test_startup_warns_when_env_differs_from_persisted_config(monkeypatch, caplog):
+    """env 改了、持久化 model_config 仍是旧值时必须告警（此前完全静默）。"""
+    from sag_api.services import settings_service
+
+    monkeypatch.setenv("SAG_LLM_TIMEOUT_MS", "180000")
+    with caplog.at_level(logging.WARNING, logger="sag.settings"):
+        settings_service._warn_persisted_beats_env({"llm_timeout_ms": 60_000})
+
+    assert "llm_timeout_ms" in caplog.text
+    assert "60000" not in caplog.text
+    assert "180000" not in caplog.text
+
+
+@pytest.mark.parametrize("env_value", [None, "", "   ", "60000"])
+def test_startup_silent_when_env_matches_or_is_unset(env_value, monkeypatch, caplog):
+    """env 未设置或与持久化值一致时不应产生噪音。"""
+    from sag_api.services import settings_service
+
+    monkeypatch.delenv("SAG_LLM_TIMEOUT_MS", raising=False)
+    if env_value is not None:
+        monkeypatch.setenv("SAG_LLM_TIMEOUT_MS", env_value)
+    with caplog.at_level(logging.WARNING, logger="sag.settings"):
+        settings_service._warn_persisted_beats_env({"llm_timeout_ms": 60_000})
+
+    assert caplog.text == ""
+
+
+def test_startup_warns_for_secret_mismatch_without_printing_values(monkeypatch, caplog):
+    """密钥字段只提示存在差异，绝不把值写进日志。"""
+    from sag_api.services import settings_service
+
+    monkeypatch.setenv("SAG_LLM_API_KEY", "env-key")
+    with caplog.at_level(logging.WARNING, logger="sag.settings"):
+        settings_service._warn_persisted_beats_env({"llm_api_key": "persisted-key"})
+
+    assert "llm_api_key" in caplog.text
+    assert "env-key" not in caplog.text
+    assert "persisted-key" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("field", "env_value", "persisted", "warns"),
+    [
+        ("llm_timeout_ms", "180000", 60_000, False),
+        ("llm_api_key", "env-key", "persisted-key", False),
+        ("embedding_model", "new-model", "old-model", True),
+    ],
+)
+def test_startup_warning_respects_llm_lock(field, env_value, persisted, warns, monkeypatch, caplog):
+    from sag_api.services import settings_service
+
+    monkeypatch.setattr(settings_service._settings, "lock_llm_config", True)
+    monkeypatch.setenv(f"SAG_{field.upper()}", env_value)
+    with caplog.at_level(logging.WARNING, logger="sag.settings"):
+        settings_service._warn_persisted_beats_env({field: persisted})
+
+    assert (field in caplog.text) is warns
+
+
+def test_startup_warning_does_not_print_endpoint_credentials(monkeypatch, caplog):
+    from sag_api.services import settings_service
+
+    monkeypatch.setenv("SAG_LLM_BASE_URL", "https://new.example.test/v1")
+    persisted = "https://user:test-password@example.test/v1?token=test-token"
+    with caplog.at_level(logging.WARNING, logger="sag.settings"):
+        settings_service._warn_persisted_beats_env({"llm_base_url": persisted})
+
+    assert "llm_base_url" in caplog.text
+    assert "test-password" not in caplog.text
+    assert "test-token" not in caplog.text
+    assert "https://" not in caplog.text
+
+
+@pytest.mark.parametrize("status,invalid", [(400, False), (400, True), (401, False), (429, False), (500, False)])
+async def test_model_probe_http_guided_grammar_fallback_and_local_validation(monkeypatch, status, invalid):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    calls = []
+
+    class Upstream(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            calls.append(body)
+            mode = body.get("response_format", {}).get("type")
+            if mode == "json_schema":
+                self.send_response(status)
+                result = {"error": {"message": "guided_grammar is not supported", "type": "invalid_request_error"}}
+            else:
+                self.send_response(200)
+                content = "pong" if mode is None else ('{"ok": "wrong-type"}' if invalid else '{"ok": true}')
+                result = {"id": "probe", "object": "chat.completion", "created": 1, "model": "probe-model",
+                          "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
+                                       "finish_reason": "stop"}]}
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        async with _self_hosted_model_config_client(monkeypatch) as (client, headers, config, payload):
+            payload.update(llm_base_url=f"http://127.0.0.1:{server.server_port}/v1", llm_model="probe-model",
+                           llm_structured_output_mode="auto", llm_max_retries=0)
+            result = await client.post("/api/v1/system/model-config/test", headers=headers, json=payload)
+            assert result.status_code == 200
+            assert result.json()["ok"] is (status == 400 and not invalid)
+            assert result.json()["completion"]["ok"] is True
+            assert result.json()["structured"]["ok"] is (status == 400 and not invalid)
+            assert (await client.get("/api/v1/system/model-config", headers=headers)).json() == config
+        modes = [call.get("response_format", {}).get("type") for call in calls]
+        assert modes == ([None, "json_schema", "json_object"] if status == 400 else [None, "json_schema"])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

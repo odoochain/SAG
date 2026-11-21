@@ -5,14 +5,15 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-SearchStrategy = Literal["vector", "multi", "multi_es_fast"]
-SEARCH_STRATEGIES = frozenset({"vector", "multi", "multi_es_fast"})
+SearchStrategy = Literal["vector", "multi", "multi_es_fast", "multi_jev"]
+SEARCH_STRATEGIES = frozenset({"vector", "multi", "multi_es_fast", "multi_jev"})
 
 # 策略对底层引擎能力的依赖。缺失能力的部署会在 UI 灰置该选项；后端调用则拒绝。
 SEARCH_STRATEGY_REQUIREMENTS: dict[str, frozenset[str]] = {
     "vector": frozenset(),
     "multi": frozenset(),
     "multi_es_fast": frozenset({"lexical_search"}),
+    "multi_jev": frozenset({"lexical_search", "jev"}),
 }
 
 
@@ -45,6 +46,8 @@ class SourceStatus(StrEnum):
     ACTIVE = "active"
     PAUSED = "paused"
     ERROR = "error"
+    DELETING = "deleting"
+    DELETE_FAILED = "delete_failed"
 
 
 class DocumentStatus(StrEnum):
@@ -63,6 +66,7 @@ class JobType(StrEnum):
     PROCESS_DOCUMENT = "process_document"
     REPROCESS_DOCUMENT = "reprocess_document"
     DELETE_DOCUMENT = "delete_document"
+    DELETE_SOURCE = "delete_source"
     SYNC_SOURCE = "sync_source"
     INDEX_UNIVERSE = "index_universe"
     OCTX_PREFLIGHT = "octx_preflight"

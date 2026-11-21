@@ -12,6 +12,7 @@ export type DocumentActivityPhase =
   | "pausing"
   | "resuming"
   | "deleting"
+  | "delete-paused"
   | "waiting-retry";
 
 export interface DocumentMutationState {
@@ -26,6 +27,7 @@ export interface DocumentActivity {
   phase: DocumentActivityPhase;
   progress: number;
   busy: boolean;
+  canPause: boolean;
   canDelete: boolean;
   poll: boolean;
   error: string | null;
@@ -37,6 +39,7 @@ export type DocumentActivityLabelKey =
   | "pausing"
   | "resuming"
   | "deleting"
+  | "deletePaused"
   | "waitingRetry";
 
 const PROCESSING_STATES = new Set<DocumentStatus>([
@@ -45,6 +48,14 @@ const PROCESSING_STATES = new Set<DocumentStatus>([
   "extracting",
   "pausing",
   "deleting",
+]);
+// The worker accepts a pause while the document is still pending, loading or
+// extracting. A freshly requeued document keeps its previous (failed) status
+// until the worker picks it up, and in that window there is no job to stop yet.
+const PAUSABLE_STATES = new Set<DocumentStatus>([
+  "pending",
+  "loading",
+  "extracting",
 ]);
 const FAILED_POLLING_WINDOW_MS = 15_000;
 
@@ -55,11 +66,7 @@ function clampProgress(value: number) {
 export function documentActivityLabelKey(
   phase: DocumentActivityPhase,
 ): DocumentActivityLabelKey {
-  return phase === "waiting-retry" ? "waitingRetry" : phase;
-}
-
-export function documentActivityShowsProgress(phase: DocumentActivityPhase) {
-  return phase !== "ready" && phase !== "deleting" && phase !== "delete_failed";
+  return phase === "waiting-retry" ? "waitingRetry" : phase === "delete-paused" ? "deletePaused" : phase;
 }
 
 export function beginDocumentMutation(
@@ -113,7 +120,8 @@ export function shouldKeepDocumentMutation(
   mutation: DocumentMutationState,
 ) {
   if (mutation.action === "delete") {
-    return Boolean(document && document.status !== "delete_failed");
+    return Boolean(document && document.status !== "delete_failed"
+      && mutation.job?.status !== "paused" && mutation.job?.status !== "failed");
   }
   if (mutation.action === "resume" && document?.status !== "paused") {
     return false;
@@ -157,6 +165,11 @@ export function shouldPollDocument(
   failedUntil?: number,
 ) {
   if (mutation && shouldKeepDocumentMutation(document, mutation)) return true;
+  if (document.status === "deleting" || document.status === "delete_failed") {
+    const job = mutation?.action === "delete" ? mutation.job ?? document.deletion_job : document.deletion_job;
+    return job ? job.status === "queued" || job.status === "running" || job.status === "succeeded"
+      : document.status === "deleting";
+  }
   if (PROCESSING_STATES.has(document.status)) return true;
   return document.status === "failed" && typeof failedUntil === "number" && failedUntil > now;
 }
@@ -178,27 +191,38 @@ export function deriveDocumentActivity(
   const mutationActive = Boolean(
     mutation && shouldKeepDocumentMutation(document, mutation),
   );
-  const canDelete =
-    document.status !== "deleting"
-    && !(
+  if (document.status === "deleting" || document.status === "delete_failed") {
+    const job = mutation?.action === "delete" ? mutation.job ?? document.deletion_job : document.deletion_job;
+    const paused = job?.status === "paused";
+    const failed = job ? job.status === "failed" : document.status === "delete_failed";
+    return {
+      phase: paused ? "delete-paused" : failed ? "delete_failed" : "deleting",
+      progress, busy: !paused && !failed, canPause: false, canDelete: paused || failed,
+      poll, error: failed ? job?.error ?? document.error : null,
+    };
+  }
+  const canDelete = !(
       mutation
       && mutationActive
       && (mutation.action === "delete" || !mutation.job)
     );
+  const canPause =
+    PAUSABLE_STATES.has(document.status)
+    && !(mutation && mutationActive && mutation.action === "pause");
 
   if (mutation && mutationActive) {
     if (mutation.action === "delete") {
-      return { phase: "deleting", progress, busy: true, canDelete, poll, error: null };
+      return { phase: "deleting", progress, busy: true, canPause, canDelete, poll, error: null };
     }
     if (mutation.action === "pause" && document.status !== "paused") {
-      return { phase: "pausing", progress, busy: true, canDelete, poll, error: null };
+      return { phase: "pausing", progress, busy: true, canPause, canDelete, poll, error: null };
     }
     if (mutation.action === "resume" && (!mutation.job || mutation.job.status === "queued")) {
-      return { phase: "resuming", progress, busy: true, canDelete, poll, error: null };
+      return { phase: "resuming", progress, busy: true, canPause, canDelete, poll, error: null };
     }
     if (mutation.action === "reprocess") {
       if (!mutation.job) {
-        return { phase: "requeueing", progress, busy: true, canDelete, poll, error: null };
+        return { phase: "requeueing", progress, busy: true, canPause, canDelete, poll, error: null };
       }
       if (mutation.job.status === "queued") {
         const waitingRetry = Boolean(mutation.job.error);
@@ -206,6 +230,7 @@ export function deriveDocumentActivity(
           phase: waitingRetry ? "waiting-retry" : "pending",
           progress,
           busy: true,
+          canPause,
           canDelete,
           poll,
           error: mutation.job.error,
@@ -219,12 +244,12 @@ export function deriveDocumentActivity(
     progress,
     busy:
       document.status === "pausing"
-      || document.status === "deleting"
       || Boolean(mutationActive && poll),
+    canPause,
     canDelete,
     poll,
     error:
-      document.status === "failed" || document.status === "delete_failed"
+      document.status === "failed"
         ? document.error
         : null,
   };

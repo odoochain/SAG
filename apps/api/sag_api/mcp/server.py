@@ -19,7 +19,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from sag_api.services.retrieval_service import retrieve_relevant_sections
+from sag_api.services.insight_service import find_entity_context
+from sag_api.services.outline_service import build_outline, render_outline_text
+from sag_api.services.retrieval_service import get_published_chunk, grep_published_chunks, retrieve_relevant_sections
 
 if TYPE_CHECKING:
     from sag_api.db.models import Document, Source
@@ -56,7 +58,7 @@ MCP_TOOL_DETAILS: tuple[MCPToolDetail, ...] = (
     {
         "name": "outline",
         "label": "文档大纲",
-        "description": "查看指定文档的章节和分块结构，并获取 chunk_id，便于快速定位内容。",
+        "description": "按标题层级查看指定文档的章节树及各章节下的分块，并获取 chunk_id，便于快速定位内容。",
     },
     {
         "name": "grep",
@@ -66,7 +68,7 @@ MCP_TOOL_DETAILS: tuple[MCPToolDetail, ...] = (
     {
         "name": "read",
         "label": "按行读原文",
-        "description": "按行分页读取指定文档的原始文本，适合查看连续上下文。",
+        "description": "按行分页读取指定文档的文本（PDF、Office 等读取解析后的 Markdown），适合查看连续上下文。",
     },
     {
         "name": "get_chunk",
@@ -103,9 +105,7 @@ class MCPScope:
     sources: tuple[Source, ...]
 
 
-_scope: contextvars.ContextVar[MCPScope | None] = contextvars.ContextVar(
-    "sag_mcp_scope", default=None
-)
+_scope: contextvars.ContextVar[MCPScope | None] = contextvars.ContextVar("sag_mcp_scope", default=None)
 
 
 def _require_scope() -> MCPScope:
@@ -153,15 +153,11 @@ def _sections_to_text(sections: list, sources: tuple[Source, ...]) -> str:
         source = by_config.get(getattr(section, "source_config_id", None))
         source = source or by_id.get(getattr(section, "source_id", None))
         source_line = f"来源：{_source_title(source)}\n" if source and len(sources) > 1 else ""
-        blocks.append(
-            f"[{index}] {heading}{tag}\n{source_line}{getattr(section, 'content', '')}"
-        )
+        blocks.append(f"[{index}] {heading}{tag}\n{source_line}{getattr(section, 'content', '')}")
     return "\n\n".join(blocks)
 
 
-async def _document_in_scope(
-    scope: MCPScope, document_id: str
-) -> tuple[Document, Source] | None:
+async def _document_in_scope(scope: MCPScope, document_id: str) -> tuple[Document, Source] | None:
     from sag_api.core.db import SessionLocal
     from sag_api.db.models import Document
 
@@ -230,7 +226,10 @@ def build_source_mcp(
             normalized,
             top_k=max(1, min(top_k, 50)),
         )
-        return _sections_to_text(outcome.sections, selected)
+        text = _sections_to_text(outcome.sections, selected)
+        if outcome.stats.get("requested_strategy") == "multi_jev" and outcome.stats.get("fallback_used"):
+            text = "（JEV 精排未完成，本次返回粗排结果）\n" + text
+        return text
 
     @mcp.tool(
         title=MCP_TOOL_LABELS["get_entity"],
@@ -254,29 +253,10 @@ def build_source_mcp(
 
         async def _one(source: Source) -> str | None:
             try:
-                scid = source.sag_source_config_id
-                entities = await scope.engine_manager.list_entities(
-                    scid, source=source, limit=200
-                )
-                lowered = target.lower()
-                match = next(
-                    (entity for entity in entities if (entity.name or "").lower() == lowered),
-                    None,
-                )
-                if match is None:
-                    match = next(
-                        (
-                            entity
-                            for entity in entities
-                            if lowered in (entity.name or "").lower()
-                        ),
-                        None,
-                    )
-                if match is None:
+                found = await find_entity_context(scope.engine_manager, source, target)
+                if found is None:
                     return None
-                snippets = await scope.engine_manager.entity_context(
-                    scid, match.id, source=source, limit=6
-                )
+                match, snippets = found
                 body = "\n\n".join(snippets) if snippets else (match.description or "")
                 prefix = f"来源：{_source_title(source)}\n" if len(selected) > 1 else ""
                 return f"{prefix}实体「{match.name}」（{match.type}）：\n{body}".strip()
@@ -328,10 +308,7 @@ def build_source_mcp(
             lines = []
             for document in rows:
                 status = getattr(document.status, "value", document.status)
-                lines.append(
-                    f"- {document.filename} · id={document.id} · {status} · "
-                    f"{document.chunk_count} 分块"
-                )
+                lines.append(f"- {document.filename} · id={document.id} · {status} · {document.chunk_count} 分块")
             header = f"## {_source_title(source)}\n" if len(selected) > 1 else ""
             blocks.append(header + "\n".join(lines))
         return "\n\n".join(blocks)
@@ -347,7 +324,7 @@ def build_source_mcp(
         if match is None:
             return "（未找到该文档）"
         document, source = match
-        if not document.sag_source_id:
+        if not document.has_publication:
             return "（尚无大纲：文档可能仍在处理中）"
         rows = await scope.engine_manager.list_chunk_headings(
             source.sag_source_config_id,
@@ -356,11 +333,12 @@ def build_source_mcp(
         )
         if not rows:
             return "（尚无大纲：文档可能仍在处理中）"
-        return "\n".join(
-            f"{row['rank']:>3}. {row['heading'] or '（无标题分块）'}"
-            f"（chunk_id={row['chunk_id']}）"
-            for row in rows
+        markdown = await scope.engine_manager.get_document_markdown(
+            source.sag_source_config_id,
+            document.sag_source_id,
+            source=source,
         )
+        return render_outline_text(build_outline(markdown, rows))
 
     @mcp.tool(
         title=MCP_TOOL_LABELS["grep"],
@@ -389,12 +367,7 @@ def build_source_mcp(
 
         async def _one(source: Source) -> list[dict]:
             try:
-                return await scope.engine_manager.grep_chunks(
-                    source.sag_source_config_id,
-                    needle,
-                    source=source,
-                    limit=bounded_limit,
-                )
+                return await grep_published_chunks(scope.engine_manager, source, needle, limit=bounded_limit)
             except Exception:
                 return []
 
@@ -402,12 +375,9 @@ def build_source_mcp(
         blocks = []
         for source, rows in zip(selected, results, strict=True):
             for row in rows:
-                source_line = (
-                    f"来源：{_source_title(source)}\n" if len(selected) > 1 else ""
-                )
+                source_line = f"来源：{_source_title(source)}\n" if len(selected) > 1 else ""
                 blocks.append(
-                    f"{row['heading'] or '片段'}（chunk_id={row['chunk_id']}）\n"
-                    f"{source_line}{row['snippet']}"
+                    f"{row['heading'] or '片段'}（chunk_id={row['chunk_id']}）\n{source_line}{row['snippet']}"
                 )
                 if len(blocks) >= bounded_limit:
                     break
@@ -438,25 +408,21 @@ def build_source_mcp(
         if match is None:
             return "（未找到该文档）"
         document, source = match
-        import os
+        from sag_api.services.document_service import read_document_lines
 
-        if not document.storage_path or not os.path.isfile(document.storage_path):
-            return "（原始文件不存在或已清理）"
         try:
-            with open(document.storage_path, encoding="utf-8", errors="replace") as file:
-                lines = file.readlines()
+            lines = await read_document_lines(document, source, scope.engine_manager)
         except OSError:
             return "（文件读取失败）"
+        if lines is None:
+            return "（尚无可读文本：文档可能仍在处理中，或原始文件已清理）"
         start = max(0, offset - 1)
         page = lines[start : start + max(1, min(limit, 500))]
         if not page:
             return f"（超出范围：全文共 {len(lines)} 行）"
         body = "".join(f"{start + index + 1:>5}\t{line}" for index, line in enumerate(page))
         source_line = f"来源：{_source_title(source)}\n" if len(scope.sources) > 1 else ""
-        return (
-            f"{document.filename} · 第 {start + 1}-{start + len(page)} 行 / "
-            f"共 {len(lines)} 行\n{source_line}{body}"
-        )
+        return f"{document.filename} · 第 {start + 1}-{start + len(page)} 行 / 共 {len(lines)} 行\n{source_line}{body}"
 
     @mcp.tool(
         title=MCP_TOOL_LABELS["get_chunk"],
@@ -474,9 +440,7 @@ def build_source_mcp(
 
         async def _one(source: Source):
             try:
-                chunk = await scope.engine_manager.get_chunk(
-                    source.sag_source_config_id, cid, source=source
-                )
+                chunk = await get_published_chunk(scope.engine_manager, source, cid)
                 return source, chunk
             except Exception:
                 return source, None
@@ -510,9 +474,13 @@ async def serve_stdio(source_id: str | None = None) -> None:
 
     from sag_api.core.config import settings
     from sag_api.core.db import SessionLocal
+    from sag_api.core.litellm_policy import install_litellm_policy, uninstall_litellm_policy
     from sag_api.db.models import Source
     from sag_api.sag import EngineManager
+    from sag_api.services.chatbot_service import SettingsView
+    from sag_api.services.settings_service import apply_startup_overrides
 
+    await apply_startup_overrides(SessionLocal)
     engine_manager = EngineManager(settings)
     async with SessionLocal() as session:
         statement = select(Source).order_by(Source.created_at, Source.id)
@@ -523,11 +491,15 @@ async def serve_stdio(source_id: str | None = None) -> None:
         raise SystemExit(f"信源不存在：{source_id}")
 
     mcp = get_source_mcp()
+    policy = install_litellm_policy(SettingsView(settings))
     try:
         with use_scope(engine_manager, sources):
             await mcp.run_stdio_async()
     finally:
-        await engine_manager.aclose_all()
+        try:
+            await engine_manager.aclose_all()
+        finally:
+            uninstall_litellm_policy(policy)
 
 
 def _main() -> None:

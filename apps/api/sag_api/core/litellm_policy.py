@@ -9,6 +9,7 @@ patching ``site-packages``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -16,7 +17,7 @@ from typing import Any
 from sag_api.core.config import Settings
 
 _COMPLETION_CALL_TYPES = {"completion", "acompletion"}
-_DEEPSEEK_V4_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
+_DEEPSEEK_THINKING_SWITCH_MODELS = {"deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"}
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class CapabilityKey:
     provider: str
     base_url: str
     model: str
+    credential_identity: str = ""
 
 
 class StructuredOutputCapabilityCache:
@@ -45,8 +47,24 @@ class StructuredOutputCapabilityCache:
         return lock
 
 
+def _effective_settings(settings: Settings) -> Settings:
+    from sag_api.generation.responses.routing import request_settings
+    from sag_api.services.chatbot_service import operation, query_scope
+
+    snapshot = operation.get()
+    if snapshot is not None and query_scope.get() and snapshot.connections["llm"].enabled:
+        return snapshot.settings
+    return request_settings.get() or settings
+
+
 def _capability_key(request: Mapping[str, Any], settings: Settings) -> CapabilityKey:
     model = str(request.get("model") or settings.routed_llm_model)
+    credential = hashlib.sha256(str(request.get("api_key") or settings.llm_api_key or "").encode()).hexdigest()
+    if model.startswith("sag_responses/"):
+        from sag_api.core.responses import Config as ResponsesConfig
+
+        config = ResponsesConfig.from_settings(settings)
+        return CapabilityKey("responses:" + config.provider, config.endpoint, model, credential)
     explicit_provider = request.get("custom_llm_provider")
     provider = str(
         explicit_provider
@@ -57,8 +75,8 @@ def _capability_key(request: Mapping[str, Any], settings: Settings) -> Capabilit
         or request.get("base_url")
         or settings.llm_base_url
         or ""
-    ).rstrip("/").casefold()
-    return CapabilityKey(provider, base_url, model.casefold())
+    ).rstrip("/")
+    return CapabilityKey(provider, base_url, model, credential)
 
 
 def _json_schema_request(request: Mapping[str, Any]) -> bool:
@@ -99,7 +117,7 @@ def should_downgrade_json_schema(
     # ``json_schema``.  Some OpenAI-compatible gateways (including DeepSeek
     # v4 Flash) only report that the response_format *type* is unavailable,
     # without echoing the concrete type name.
-    names_structured_output = "json_schema" in summary or "response_format" in summary
+    names_structured_output = any(name in summary for name in ("json_schema", "response_format", "guided_grammar"))
     unsupported = any(
         phrase in summary
         for phrase in (
@@ -134,9 +152,9 @@ def _is_openai_route(model: str, settings: Settings) -> bool:
     return settings.llm_provider == "openai"
 
 
-def _is_deepseek_v4(model: str) -> bool:
+def _has_deepseek_thinking_switch(model: str) -> bool:
     model_id = model.rsplit("/", 1)[-1].casefold()
-    return model_id in _DEEPSEEK_V4_MODELS
+    return model_id in _DEEPSEEK_THINKING_SWITCH_MODELS
 
 
 def _with_allowed_openai_param(request: dict[str, Any], name: str) -> None:
@@ -164,12 +182,36 @@ def apply_litellm_completion_policy(
     infer.  An explicit ``enable_thinking: true`` remains an opt-in override.
     """
 
+    from sag_api.core.chatbot_config import KEYLESS_API_KEY
+    from sag_api.services.chatbot_service import operation, query_scope
+
     normalized = dict(request)
+    settings = _effective_settings(settings)
+    snapshot = operation.get()
+    if snapshot is not None and query_scope.get() and snapshot.connections["llm"].enabled:
+        settings = snapshot.settings
+        normalized["extra_body"] = dict(settings.llm_extra_body or {})
+        normalized["temperature"] = settings.effective_llm_temperature
+        if not snapshot.connections["llm"].api_key:
+            from openai import omit
+
+            normalized["api_key"] = KEYLESS_API_KEY
+            if settings.llm_provider == "openai":
+                normalized["extra_headers"] = {**(normalized.get("extra_headers") or {}), "Authorization": omit}
     if "extra_body" not in normalized and settings.llm_extra_body:
         normalized["extra_body"] = dict(settings.llm_extra_body)
 
     model = str(normalized.get("model") or settings.routed_llm_model)
-    if _is_deepseek_v4(model):
+    if model.startswith("sag_responses/"):
+        from sag_api.core.responses import Config as ResponsesConfig
+        from sag_api.generation.responses.policy import normalize_thinking
+
+        normalized["extra_body"] = {**(settings.llm_extra_body or {}), **(normalized.get("extra_body") or {})}
+        normalized = normalize_thinking(normalized, ResponsesConfig.from_settings(settings).thinking_rules)
+        if normalized.get("stream"):
+            normalized["stream_options"] = {**(normalized.get("stream_options") or {}), "include_usage": True}
+        return normalized
+    if _has_deepseek_thinking_switch(model):
         extra_body = dict(normalized.get("extra_body") or {})
         extra_body["thinking"] = {"type": "disabled"}
         normalized["extra_body"] = extra_body
@@ -190,6 +232,10 @@ def install_litellm_policy(settings: Settings) -> Any:
     import litellm
     from litellm.integrations.custom_logger import CustomLogger
 
+    from sag_api.generation.responses.routing import register
+
+    register()
+
     class MuseLiteLLMPolicy(CustomLogger):
         async def async_pre_call_deployment_hook(
             self,
@@ -207,11 +253,12 @@ def install_litellm_policy(settings: Settings) -> Any:
     cache = StructuredOutputCapabilityCache()
 
     async def sag_acompletion(*args: Any, **kwargs: Any) -> Any:
-        if settings.llm_structured_output_mode != "auto" or not _json_schema_request(
+        active = _effective_settings(settings)
+        if active.llm_structured_output_mode != "auto" or not _json_schema_request(
             kwargs
         ):
             return await original_acompletion(*args, **kwargs)
-        key = _capability_key(kwargs, settings)
+        key = _capability_key(kwargs, active)
         known = cache.get(key)
         if known == "json_object":
             return await original_acompletion(*args, **_with_json_object(kwargs))
@@ -227,7 +274,7 @@ def install_litellm_policy(settings: Settings) -> Any:
             try:
                 result = await original_acompletion(*args, **kwargs)
             except Exception as error:
-                if not should_downgrade_json_schema(error, kwargs, settings):
+                if not should_downgrade_json_schema(error, kwargs, active):
                     raise
                 cache.mark(key, "json_object")
                 return await original_acompletion(

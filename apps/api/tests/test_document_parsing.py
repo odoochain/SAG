@@ -6,12 +6,14 @@ import asyncio
 import io
 import logging
 import zipfile
+from contextlib import AsyncExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
+from document_requests import DocumentRequestBuilder, document_receipt, document_request
 
 from sag_api.core.config import Settings
 from sag_api.core.errors import (
@@ -22,7 +24,63 @@ from sag_api.core.errors import (
 from sag_api.parsing import service
 from sag_api.parsing.mineru import MinerUClient, _assert_public_host, _interpret_poll_payload
 from sag_api.parsing.service import PreparedDocument
-from sag_api.sag.dto import ProcessCheckpoint, ProcessOutcome
+from tests.document_requests import UncommittedDocumentManager, controller_processing_identity, processing_parameters
+
+pytestmark = pytest.mark.usefixtures("controller_identity")
+
+
+@pytest.fixture
+async def parser_task_records():
+    """Keep parser/model seams virtual while all business persistence is real."""
+    from sqlalchemy import delete
+
+    from sag_api.core.db import SessionLocal, init_db
+    from sag_api.db.models import Document, Job, Source
+    from sag_api.enums import DocumentStatus, JobStatus, JobType
+
+    await init_db()
+    source_ids = []
+    async with AsyncExitStack() as sessions:
+
+        async def create(overrides=None):
+            session = await sessions.enter_async_context(SessionLocal())
+            source = Source(name="parser-task-real", sag_source_config_id="sag-source-1")
+            session.add(source)
+            await session.flush()
+            source_ids.append(source.id)
+            document = Document(
+                source_id=source.id,
+                **{
+                    "filename": "report.docx",
+                    "storage_path": "/uploads/report.docx",
+                    "status": DocumentStatus.PENDING,
+                    **(overrides or {}),
+                },
+            )
+            session.add(document)
+            await session.flush()
+            job = Job(
+                type=JobType.PROCESS_DOCUMENT,
+                status=JobStatus.RUNNING,
+                source_id=source.id,
+                document_id=document.id,
+                payload={},
+            )
+            session.add(job)
+            await session.commit()
+            return session, document, source, job
+
+        yield create
+    async with SessionLocal() as cleanup:
+        await cleanup.execute(delete(Source).where(Source.id.in_(source_ids)))
+        await cleanup.commit()
+
+
+def _document(**fields):
+    """Keep task doubles aligned with the nullable processing snapshot contract."""
+    return SimpleNamespace(
+        processing_run_id=None, processing_stage=None, processed_chunks=None, total_chunks=None, **fields
+    )
 
 
 def _settings(**overrides: Any) -> Settings:
@@ -443,115 +501,96 @@ async def test_concurrent_mineru_failure_creates_one_task_and_one_fallback(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_document_job_sends_parsed_markdown_to_engine(monkeypatch):
-    from sag_api.db.models import Document, Source
-    from sag_api.enums import DocumentStatus
+@pytest.mark.parametrize("extension", ["pdf", "xls", "xlsx"])
+async def test_document_job_sends_parsed_markdown_to_engine(monkeypatch, extension):
+    from uuid import uuid4
+
+    from sag_api.core.db import SessionLocal, init_db
+    from sag_api.db.models import Document, Job, Source
+    from sag_api.enums import DocumentStatus, JobStatus, JobType
     from sag_api.jobs import tasks
 
-    document = SimpleNamespace(
-        id="doc-1",
-        source_id="source-1",
-        filename="original.pdf",
-        storage_path="/uploads/original.pdf",
-        status=None,
+    source = Source(
+        name="parser-public", sag_source_config_id=uuid4().hex, config={"octx_vector_identity_state": "mixed"}
+    )
+    await init_db()
+    document = Document(
+        source_id=source.id,
+        filename=f"original.{extension}",
+        storage_path=f"/uploads/original.{extension}",
+        status=DocumentStatus.PENDING,
         error="previous attempt failed",
         chunk_count=0,
         event_count=0,
         progress=0,
         token_usage=0,
         sag_source_id=None,
+        vector_identity=None,
     )
-    source = SimpleNamespace(
-        id="source-1",
-        sag_source_config_id="sag-source-1"[:36],
-        chunk_count=0,
-        event_count=0,
-    )
-    job = SimpleNamespace(id="job-1", document_id="doc-1", progress=0.0, payload={})
-
-    class FakeSession:
-        async def get(self, model, _id):
-            return document if model is Document else source if model is Source else None
-
-        async def commit(self):
-            pass
-
-        async def execute(self, _statement):
-            document.status = DocumentStatus.READY
-            document.chunk_count = 2
-            document.event_count = 1
-            document.sag_source_id = "engine-doc"
-            document.progress = 100
-            document.token_usage = 2468
-            return SimpleNamespace(rowcount=1)
-
-        async def scalar(self, _statement):
-            return None
-
-        async def refresh(self, _instance, attribute_names=None):
-            pass
+    job = Job(type=JobType.PROCESS_DOCUMENT, status=JobStatus.RUNNING, payload={})
 
     prepared_calls: list[str] = []
     stage_errors: list[tuple[str, str | None]] = []
 
     async def fake_prepare(path, settings, *, state=None, on_state=None, should_pause=None):
         prepared_calls.append(path)
-        return PreparedDocument("/uploads/original.pdf.parsed.markitdown.md", "markitdown")
+        return PreparedDocument(f"/uploads/original.{extension}.parsed.markitdown.md", "markitdown")
 
-    class FakeEngineManager:
+    class FakeEngineManager(UncommittedDocumentManager):
         seen_path = ""
 
         async def process_document(
             self,
             source_config_id,
-            path,
+            request_factory,
             *,
             source,
             on_stage,
-            checkpoint,
-            on_checkpoint,
+            on_progress,
             should_pause,
-            max_concurrency,
             document_title,
         ):
-            self.seen_path = path
-            assert max_concurrency == tasks.settings.document_extract_concurrency
+            builder = DocumentRequestBuilder(source_config_id)
+            request = await request_factory(builder, *processing_parameters())
+            self.seen_path, original_path = builder.paths[-1]
+            assert original_path == document.storage_path
             assert document_title == "original"
             await on_stage("loading")
             stage_errors.append(("loading", document.error))
-            await on_checkpoint(
-                ProcessCheckpoint(
-                    source_id="engine-doc",
-                    chunk_ids=["chunk-1", "chunk-2"],
-                    processed_chunk_ids=["chunk-1"],
-                    event_count=1,
-                    event_ids=["event-1"],
-                    token_usage=1234,
-                )
-            )
             await on_stage("extracting")
             stage_errors.append(("extracting", document.error))
-            return ProcessOutcome(
-                source_id="engine-doc",
-                chunk_count=2,
-                event_count=1,
-                chunk_ids=["chunk-1", "chunk-2"],
-                processed_chunk_ids=["chunk-1", "chunk-2"],
-                token_usage=2468,
-            )
+            return document_receipt(request, chunk_count=2, event_count=1, token_usage=2468)
 
     monkeypatch.setattr(tasks, "prepare_document", fake_prepare)
     engine = FakeEngineManager()
-    await tasks._process_document_unlocked(FakeSession(), job, engine_manager=engine)
+    async with SessionLocal() as session:
+        session.add(source)
+        await session.flush()
+        document.source_id = source.id
+        session.add(document)
+        await session.flush()
+        job.source_id, job.document_id = source.id, document.id
+        session.add(job)
+        await session.commit()
+        try:
+            await tasks._process_document_unlocked(session, job, engine_manager=engine, lease_lost=asyncio.Event())
 
-    assert prepared_calls == ["/uploads/original.pdf"]
-    assert stage_errors == [("loading", None), ("extracting", None)]
-    assert engine.seen_path.endswith(".md")
-    assert document.status.value == "ready"
-    assert document.chunk_count == 2 and document.event_count == 1
-    assert document.progress == 100 and document.token_usage == 2468
-    assert document.parser_provider == "markitdown"
-    assert document.parser_status == "done"
+            assert prepared_calls == [f"/uploads/original.{extension}"]
+            assert stage_errors == [("loading", None), ("extracting", None)]
+            assert engine.seen_path.endswith(".md")
+            assert document.status.value == "ready"
+            assert document.chunk_count == 2 and document.event_count == 1
+            assert document.progress == 100 and document.token_usage == 2468
+            assert document.parser_provider == "markitdown"
+            assert document.parser_status == "done"
+            expected_identity = tasks.configured_embedding_identity(processing_parameters()[1])
+            assert document.vector_identity == expected_identity
+            assert source.config["octx_vector_identity_state"] == "known"
+            assert source.config["octx_vector_identity"] == expected_identity
+        finally:
+            await session.rollback()
+            await session.delete(source)
+            await session.commit()
 
 
 @pytest.mark.asyncio
@@ -589,40 +628,16 @@ async def test_document_job_sends_parsed_markdown_to_engine(monkeypatch):
     ],
 )
 async def test_document_job_persists_successful_mineru_outcome(
-    monkeypatch, parser_state, expected_provider, expected_model
+    monkeypatch, parser_state, expected_provider, expected_model, parser_task_records
 ):
-    from sag_api.db.models import Document, Source
-    from sag_api.enums import DocumentStatus
     from sag_api.jobs import tasks
 
-    document = SimpleNamespace(
-        id="doc-mineru",
-        source_id="source-1",
-        filename="paper.pdf",
-        storage_path="/uploads/paper.pdf",
-        status=DocumentStatus.PENDING,
-        error=None,
-        chunk_count=0,
-        event_count=0,
-        progress=0,
-        token_usage=0,
-        sag_source_id=None,
+    session, document, _source, job = await parser_task_records(
+        {
+            "filename": "paper.pdf",
+            "storage_path": "/uploads/paper.pdf",
+        }
     )
-    source = SimpleNamespace(id="source-1", sag_source_config_id="sag-source-1")
-    job = SimpleNamespace(id="job-mineru", document_id=document.id, progress=0.0, payload={})
-
-    class FakeSession:
-        async def get(self, model, _id):
-            return document if model is Document else source if model is Source else None
-
-        async def refresh(self, _instance, attribute_names=None):
-            pass
-
-        async def commit(self):
-            pass
-
-        async def execute(self, _statement):
-            return SimpleNamespace(rowcount=1)
 
     async def fake_prepare(path, settings, *, state=None, on_state=None, should_pause=None):
         assert on_state is not None
@@ -635,24 +650,18 @@ async def test_document_job_persists_successful_mineru_outcome(
         )
         return PreparedDocument(f"{path}.parsed.mineru.md", "mineru")
 
-    class FakeEngineManager:
+    class FakeEngineManager(UncommittedDocumentManager):
         async def process_document(self, *args, **kwargs):
-            return ProcessOutcome(
-                source_id="engine-doc",
+            return document_receipt(
+                await args[1](DocumentRequestBuilder(args[0]), *processing_parameters()),
                 chunk_count=1,
                 event_count=1,
-                chunk_ids=["chunk-1"],
-                processed_chunk_ids=["chunk-1"],
                 token_usage=123,
             )
 
-    async def no_op_touch(*args):
-        return None
-
     monkeypatch.setattr(tasks, "prepare_document", fake_prepare)
-    monkeypatch.setattr(tasks, "touch_source_revision", no_op_touch)
 
-    await tasks._process_document_unlocked(FakeSession(), job, engine_manager=FakeEngineManager())
+    await tasks._process_document_unlocked(session, job, engine_manager=FakeEngineManager(), lease_lost=asyncio.Event())
 
     assert document.parser_provider == "mineru"
     assert document.mineru_provider == expected_provider
@@ -664,40 +673,16 @@ async def test_document_job_persists_successful_mineru_outcome(
 
 
 @pytest.mark.asyncio
-async def test_document_job_persists_mineru_markitdown_fallback(monkeypatch, caplog):
-    from sag_api.db.models import Document, Source
-    from sag_api.enums import DocumentStatus
+async def test_document_job_persists_mineru_markitdown_fallback(monkeypatch, caplog, parser_task_records):
     from sag_api.jobs import tasks
 
-    document = SimpleNamespace(
-        id="doc-fallback",
-        source_id="source-1",
-        filename="paper.pdf",
-        storage_path="/uploads/paper.pdf",
-        status=DocumentStatus.PENDING,
-        error=None,
-        chunk_count=0,
-        event_count=0,
-        progress=0,
-        token_usage=0,
-        sag_source_id=None,
+    session, document, _source, job = await parser_task_records(
+        {
+            "filename": "paper.pdf",
+            "storage_path": "/uploads/paper.pdf",
+        }
     )
-    source = SimpleNamespace(id="source-1", sag_source_config_id="sag-source-1")
-    job = SimpleNamespace(id="job-fallback", document_id=document.id, progress=0.0, payload={})
     raw_reason = "MinerU failed with sk-secret123 at https://files.example/result?token=signed-value"
-
-    class FakeSession:
-        async def get(self, model, _id):
-            return document if model is Document else source if model is Source else None
-
-        async def refresh(self, _instance, attribute_names=None):
-            pass
-
-        async def commit(self):
-            pass
-
-        async def execute(self, _statement):
-            return SimpleNamespace(rowcount=1)
 
     async def fake_prepare(path, settings, *, state=None, on_state=None, should_pause=None):
         assert on_state is not None
@@ -722,27 +707,19 @@ async def test_document_job_persists_mineru_markitdown_fallback(monkeypatch, cap
             fallback_error=raw_reason,
         )
 
-    class FakeEngineManager:
+    class FakeEngineManager(UncommittedDocumentManager):
         async def process_document(self, *args, **kwargs):
-            return ProcessOutcome(
-                source_id="engine-doc",
+            return document_receipt(
+                await args[1](DocumentRequestBuilder(args[0]), *processing_parameters()),
                 chunk_count=1,
                 event_count=0,
-                chunk_ids=["chunk-1"],
-                processed_chunk_ids=["chunk-1"],
                 token_usage=0,
             )
 
-    async def no_op_touch(*args):
-        return None
-
     monkeypatch.setattr(tasks, "prepare_document", fake_prepare)
-    monkeypatch.setattr(tasks, "touch_source_revision", no_op_touch)
 
     caplog.set_level(logging.WARNING, logger="sag.jobs")
-    await tasks._process_document_unlocked(
-        FakeSession(), job, engine_manager=FakeEngineManager()
-    )
+    await tasks._process_document_unlocked(session, job, engine_manager=FakeEngineManager(), lease_lost=asyncio.Event())
 
     assert document.parser_provider == "markitdown"
     assert document.mineru_provider == "302"
@@ -759,55 +736,16 @@ async def test_document_job_persists_mineru_markitdown_fallback(monkeypatch, cap
 
 
 @pytest.mark.asyncio
-async def test_document_job_redacts_parser_failure_from_public_error(
-    monkeypatch, caplog
-):
-    from sag_api.db.models import Document, Source
-    from sag_api.enums import DocumentStatus
+async def test_document_job_redacts_parser_failure_from_public_error(monkeypatch, caplog, parser_task_records):
     from sag_api.jobs import tasks
 
     raw_reason = (
         "Parser failed with Bearer secret-token and sk-secret123 at "
         "https://files.example/result?token=signed-value " + "detail " * 100
     )
-    document = SimpleNamespace(
-        id="doc-parser-failed",
-        source_id="source-1",
-        filename="paper.pdf",
-        storage_path="/uploads/paper.pdf",
-        status=DocumentStatus.PENDING,
-        error=None,
-        chunk_count=0,
-        event_count=0,
-        progress=0,
-        token_usage=0,
-        sag_source_id=None,
+    session, document, _source, job = await parser_task_records(
+        {"filename": "paper.pdf", "storage_path": "/uploads/paper.pdf"}
     )
-    source = SimpleNamespace(id="source-1", sag_source_config_id="sag-source-1")
-    job = SimpleNamespace(
-        id="job-parser-failed",
-        document_id=document.id,
-        progress=0.0,
-        payload={},
-    )
-
-    class FakeSession:
-        async def get(self, model, _id):
-            return document if model is Document else source if model is Source else None
-
-        async def refresh(self, _instance, attribute_names=None):
-            pass
-
-        async def commit(self):
-            pass
-
-        async def execute(self, statement):
-            values = {
-                column.key: bound.value for column, bound in statement._values.items()
-            }
-            if "error" in values:
-                document.error = values["error"]
-            return SimpleNamespace(rowcount=1)
 
     async def fake_prepare(path, settings, *, state=None, on_state=None, should_pause=None):
         assert on_state is not None
@@ -827,17 +765,20 @@ async def test_document_job_redacts_parser_failure_from_public_error(
         )
         raise ServiceUnavailableError(raw_reason)
 
-    class FakeEngineManager:
+    class FakeEngineManager(UncommittedDocumentManager):
         async def process_document(self, *args, **kwargs):
-            raise AssertionError("engine must not run after parser failure")
+            await args[1](DocumentRequestBuilder(args[0]), *processing_parameters())
+            raise AssertionError("model execution must not run after parser failure")
 
     monkeypatch.setattr(tasks, "prepare_document", fake_prepare)
     caplog.set_level(logging.WARNING, logger="sag.jobs")
 
     with pytest.raises(ServiceUnavailableError):
         await tasks._process_document_unlocked(
-            FakeSession(), job, engine_manager=FakeEngineManager()
+            session, job, engine_manager=FakeEngineManager(), lease_lost=asyncio.Event()
         )
+
+    await session.refresh(document)
 
     assert document.parser_status == "failed"
     assert document.fallback_reason == document.error
@@ -852,52 +793,13 @@ async def test_document_job_redacts_parser_failure_from_public_error(
 
 
 @pytest.mark.asyncio
-async def test_document_job_preserves_engine_error_before_first_checkpoint(
-    monkeypatch, caplog
-):
-    from sag_api.db.models import Document, Source
-    from sag_api.enums import DocumentStatus
+async def test_document_job_preserves_engine_error_before_first_checkpoint(monkeypatch, caplog, parser_task_records):
     from sag_api.jobs import tasks
 
     raw_reason = "engine extraction failed before checkpoint " + "diagnostic " * 40
-    document = SimpleNamespace(
-        id="doc-engine-failed",
-        source_id="source-1",
-        filename="paper.pdf",
-        storage_path="/uploads/paper.pdf",
-        status=DocumentStatus.PENDING,
-        error=None,
-        chunk_count=0,
-        event_count=0,
-        progress=0,
-        token_usage=0,
-        sag_source_id=None,
+    session, document, _source, job = await parser_task_records(
+        {"filename": "paper.pdf", "storage_path": "/uploads/paper.pdf"}
     )
-    source = SimpleNamespace(id="source-1", sag_source_config_id="sag-source-1")
-    job = SimpleNamespace(
-        id="job-engine-failed",
-        document_id=document.id,
-        progress=0.0,
-        payload={},
-    )
-
-    class FakeSession:
-        async def get(self, model, _id):
-            return document if model is Document else source if model is Source else None
-
-        async def refresh(self, _instance, attribute_names=None):
-            pass
-
-        async def commit(self):
-            pass
-
-        async def execute(self, statement):
-            values = {
-                column.key: bound.value for column, bound in statement._values.items()
-            }
-            if "error" in values:
-                document.error = values["error"]
-            return SimpleNamespace(rowcount=1)
 
     async def fake_prepare(path, settings, *, state=None, on_state=None, should_pause=None):
         assert on_state is not None
@@ -911,9 +813,10 @@ async def test_document_job_preserves_engine_error_before_first_checkpoint(
         )
         return PreparedDocument(f"{path}.parsed.mineru.md", "mineru")
 
-    class FakeEngineManager:
+    class FakeEngineManager(UncommittedDocumentManager):
         async def process_document(self, *args, **kwargs):
-            assert not kwargs["checkpoint"].chunk_ids
+            bound = await args[1](DocumentRequestBuilder(args[0]), *processing_parameters())
+            assert bound.context.isolation == "input"
             raise RuntimeError(raw_reason)
 
     monkeypatch.setattr(tasks, "prepare_document", fake_prepare)
@@ -921,9 +824,10 @@ async def test_document_job_preserves_engine_error_before_first_checkpoint(
 
     with pytest.raises(RuntimeError, match="engine extraction failed"):
         await tasks._process_document_unlocked(
-            FakeSession(), job, engine_manager=FakeEngineManager()
+            session, job, engine_manager=FakeEngineManager(), lease_lost=asyncio.Event()
         )
 
+    await session.refresh(document)
     assert document.error == raw_reason
     assert len(document.error) > 300
     warning_text = " ".join(record.getMessage() for record in caplog.records)
@@ -931,64 +835,31 @@ async def test_document_job_preserves_engine_error_before_first_checkpoint(
 
 
 @pytest.mark.asyncio
-async def test_document_job_preserves_engine_error_on_resumed_checkpoint(
-    monkeypatch, caplog
-):
-    from sag_api.db.models import Document, Source
+async def test_document_job_preserves_engine_error_on_resumed_checkpoint(monkeypatch, caplog, parser_task_records):
     from sag_api.enums import DocumentStatus
     from sag_api.jobs import tasks
 
     raw_reason = "resumed engine extraction failed " + "checkpoint diagnostic " * 30
-    document = SimpleNamespace(
-        id="doc-resumed-engine-failed",
-        source_id="source-1",
-        filename="paper.pdf",
-        storage_path="/uploads/paper.pdf",
-        status=DocumentStatus.EXTRACTING,
-        error=None,
-        chunk_count=1,
-        event_count=0,
-        progress=20,
-        token_usage=0,
-        sag_source_id=None,
-    )
-    source = SimpleNamespace(id="source-1", sag_source_config_id="sag-source-1")
-    job = SimpleNamespace(
-        id="job-resumed-engine-failed",
-        document_id=document.id,
-        progress=0.2,
-        payload={
-            "process_checkpoint": {
-                "chunk_ids": ["chunk-1"],
-                "processed_chunk_ids": [],
-            }
-        },
+    session, document, _source, job = await parser_task_records(
+        {"filename": "paper.pdf", "storage_path": "/uploads/paper.pdf"}
     )
 
-    class FakeSession:
-        async def get(self, model, _id):
-            return document if model is Document else source if model is Source else None
-
-        async def refresh(self, _instance, attribute_names=None):
-            pass
-
-        async def commit(self):
-            pass
-
-        async def execute(self, statement):
-            values = {
-                column.key: bound.value for column, bound in statement._values.items()
-            }
-            if "error" in values:
-                document.error = values["error"]
-            return SimpleNamespace(rowcount=1)
+    document.status = DocumentStatus.EXTRACTING
+    document.progress = 20
+    job.payload = {
+        "processing_identity": controller_processing_identity(document.storage_path),
+        "process_request": document_request("sag-source-1", source_id="engine-doc").model_dump(mode="json"),
+        "control_revision": 1,
+    }
+    await session.commit()
 
     async def unexpected_prepare(*args, **kwargs):
         pytest.fail("resumed jobs must skip parser preparation")
 
-    class FakeEngineManager:
+    class FakeEngineManager(UncommittedDocumentManager):
         async def process_document(self, *args, **kwargs):
-            assert kwargs["checkpoint"].chunk_ids == ["chunk-1"]
+            bound = await args[1](None, *processing_parameters())
+            assert bound.source.descriptor.source_id == "engine-doc"
             raise RuntimeError(raw_reason)
 
     monkeypatch.setattr(tasks, "prepare_document", unexpected_prepare)
@@ -996,8 +867,10 @@ async def test_document_job_preserves_engine_error_on_resumed_checkpoint(
 
     with pytest.raises(RuntimeError, match="resumed engine extraction failed"):
         await tasks._process_document_unlocked(
-            FakeSession(), job, engine_manager=FakeEngineManager()
+            session, job, engine_manager=FakeEngineManager(), lease_lost=asyncio.Event()
         )
+
+    await session.refresh(document)
 
     assert document.error == raw_reason
     assert len(document.error) > 300
@@ -1305,9 +1178,7 @@ async def test_official_mineru_issue_105_upload_poll_and_download(tmp_path, monk
                         ],
                     },
                 },
-                url=(
-                    "https://mineru.net/api/v4/extract-results/batch/batch-105"
-                ),
+                url=("https://mineru.net/api/v4/extract-results/batch/batch-105"),
             ),
             _response(
                 content=_result_zip("# Official MinerU result"),
@@ -1321,9 +1192,7 @@ async def test_official_mineru_issue_105_upload_poll_and_download(tmp_path, monk
     async def allow_public_test_hosts(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(
-        "sag_api.parsing.mineru._assert_public_host", allow_public_test_hosts
-    )
+    monkeypatch.setattr("sag_api.parsing.mineru._assert_public_host", allow_public_test_hosts)
     states: list[dict[str, Any]] = []
     official_settings = _settings(
         mineru_provider="official",
@@ -1335,13 +1204,9 @@ async def test_official_mineru_issue_105_upload_poll_and_download(tmp_path, monk
     )
     client = MinerUClient(official_settings)
 
-    assert service._signature("mineru", official_settings) == (
-        "mineru-official-vlm-auto"
-    )
+    assert service._signature("mineru", official_settings) == ("mineru-official-vlm-auto")
 
-    markdown = await client.parse(
-        str(source), on_state=lambda state: _record(states, state)
-    )
+    markdown = await client.parse(str(source), on_state=lambda state: _record(states, state))
 
     assert markdown == "# Official MinerU result\n"
     assert [call[:2] for call in _FakeAsyncClient.calls] == [
@@ -1357,22 +1222,14 @@ async def test_official_mineru_issue_105_upload_poll_and_download(tmp_path, monk
         "files": [{"name": "paper.pdf"}],
         "model_version": "vlm",
     }
-    assert _FakeAsyncClient.calls[0][2]["headers"] == {
-        "Authorization": "Bearer official-test-token"
-    }
+    assert _FakeAsyncClient.calls[0][2]["headers"] == {"Authorization": "Bearer official-test-token"}
     assert "headers" not in _FakeAsyncClient.calls[1][2]
     assert "headers" not in _FakeAsyncClient.calls[3][2]
-    assert any(
-        state.get("batch_id") == "batch-105"
-        and state.get("upload_completed") is True
-        for state in states
-    )
+    assert any(state.get("batch_id") == "batch-105" and state.get("upload_completed") is True for state in states)
 
 
 @pytest.mark.asyncio
-async def test_official_mineru_service_entrypoint_accepts_pause_callback(
-    tmp_path, monkeypatch
-):
+async def test_official_mineru_service_entrypoint_accepts_pause_callback(tmp_path, monkeypatch):
     source = tmp_path / "paper.pdf"
     source.write_bytes(b"%PDF-fake")
     upload_url = "https://upload.example.test/paper.pdf"
@@ -1409,10 +1266,7 @@ async def test_official_mineru_service_entrypoint_accepts_pause_callback(
                         ],
                     },
                 },
-                url=(
-                    "https://mineru.net/api/v4/extract-results/batch/"
-                    "batch-service-105"
-                ),
+                url=("https://mineru.net/api/v4/extract-results/batch/batch-service-105"),
             ),
             _response(
                 content=_result_zip("# Official service entrypoint result"),
@@ -1426,9 +1280,7 @@ async def test_official_mineru_service_entrypoint_accepts_pause_callback(
     async def allow_public_test_hosts(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(
-        "sag_api.parsing.mineru._assert_public_host", allow_public_test_hosts
-    )
+    monkeypatch.setattr("sag_api.parsing.mineru._assert_public_host", allow_public_test_hosts)
     pause_checks = 0
 
     async def never_pause() -> bool:
@@ -1451,26 +1303,21 @@ async def test_official_mineru_service_entrypoint_accepts_pause_callback(
     )
 
     assert prepared.provider == "mineru"
-    assert Path(prepared.path).read_text(encoding="utf-8") == (
-        "# Official service entrypoint result\n"
-    )
+    assert Path(prepared.path).read_text(encoding="utf-8") == ("# Official service entrypoint result\n")
     assert pause_checks == 1
     assert [call[:2] for call in _FakeAsyncClient.calls] == [
         ("POST", "https://mineru.net/api/v4/file-urls/batch"),
         ("PUT", upload_url),
         (
             "GET",
-            "https://mineru.net/api/v4/extract-results/batch/"
-            "batch-service-105",
+            "https://mineru.net/api/v4/extract-results/batch/batch-service-105",
         ),
         ("DOWNLOAD", result_url),
     ]
 
 
 @pytest.mark.asyncio
-async def test_official_mineru_resume_polls_existing_uploaded_batch(
-    tmp_path, monkeypatch
-):
+async def test_official_mineru_resume_polls_existing_uploaded_batch(tmp_path, monkeypatch):
     source = tmp_path / "paper.pdf"
     source.write_bytes(b"%PDF-fake")
     result_url = "https://cdn-mineru.openxlab.org.cn/resumed.zip"
@@ -1506,9 +1353,7 @@ async def test_official_mineru_resume_polls_existing_uploaded_batch(
     async def allow_public_test_hosts(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(
-        "sag_api.parsing.mineru._assert_public_host", allow_public_test_hosts
-    )
+    monkeypatch.setattr("sag_api.parsing.mineru._assert_public_host", allow_public_test_hosts)
     client = MinerUClient(
         _settings(
             mineru_provider="official",
@@ -1540,9 +1385,7 @@ async def test_official_mineru_resume_polls_existing_uploaded_batch(
 
 
 @pytest.mark.asyncio
-async def test_official_mineru_business_error_keeps_message_and_trace(
-    tmp_path, monkeypatch
-):
+async def test_official_mineru_business_error_keeps_message_and_trace(tmp_path, monkeypatch):
     source = tmp_path / "paper.pdf"
     source.write_bytes(b"%PDF-fake")
     _FakeAsyncClient.reset(
@@ -1562,9 +1405,7 @@ async def test_official_mineru_business_error_keeps_message_and_trace(
     async def allow_public_test_hosts(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(
-        "sag_api.parsing.mineru._assert_public_host", allow_public_test_hosts
-    )
+    monkeypatch.setattr("sag_api.parsing.mineru._assert_public_host", allow_public_test_hosts)
     client = MinerUClient(
         _settings(
             mineru_provider="official",
@@ -1573,9 +1414,7 @@ async def test_official_mineru_business_error_keeps_message_and_trace(
         )
     )
 
-    with pytest.raises(
-        UpstreamError, match="请确保文件已上传.*trace_id: trace-105"
-    ):
+    with pytest.raises(UpstreamError, match="请确保文件已上传.*trace_id: trace-105"):
         await client.parse(str(source))
 
 
@@ -1699,3 +1538,352 @@ async def test_mineru_result_download_allows_fake_ip_proxy_dns(fake_ip):
     # TUN 网关按映射表转发到真实公网地址；该段不指向任何真实内网服务，
     # 不应被 SSRF 守卫当作内网拒绝。
     await _assert_public_host(fake_ip, 443)
+
+
+async def _document_job_fixture(parser_task_records, *, document_overrides=None):
+    """Build actual business records with a portable model receipt seam."""
+    from sag_api.jobs import tasks
+
+    session, document, _source, job = await parser_task_records(document_overrides)
+
+    class FakeEngineManager(UncommittedDocumentManager):
+        async def process_document(self, *args, **kwargs):
+            return document_receipt(
+                await args[1](DocumentRequestBuilder(args[0]), *processing_parameters()),
+                chunk_count=1,
+                event_count=0,
+                token_usage=0,
+            )
+
+    return tasks, document, job, session, FakeEngineManager()
+
+
+@pytest.mark.asyncio
+async def test_document_job_persists_anydoc_success(monkeypatch, parser_task_records):
+    tasks, document, job, session, engine = await _document_job_fixture(
+        parser_task_records,
+    )
+
+    async def fake_prepare(path, settings, *, state=None, on_state=None, should_pause=None):
+        assert on_state is not None
+        await on_state({"provider": "anydoc", "status": "running"})
+        await on_state(
+            {
+                "provider": "anydoc",
+                "signature": "anydoc-0.2.4-v1",
+                "status": "done",
+                "cache_path": f"{path}.parsed.anydoc-0.2.4-v1.md",
+            }
+        )
+        return PreparedDocument(f"{path}.parsed.anydoc-0.2.4-v1.md", "anydoc")
+
+    monkeypatch.setattr(tasks, "prepare_document", fake_prepare)
+
+    await tasks._process_document_unlocked(session, job, engine_manager=engine, lease_lost=asyncio.Event())
+
+    assert document.parser_provider == "anydoc"
+    assert document.parser_status == "done"
+    assert document.fallback_from is None
+    assert document.fallback_reason is None
+    assert document.mineru_provider is None and document.mineru_model is None
+
+
+@pytest.mark.asyncio
+async def test_document_job_persists_anydoc_markitdown_fallback(monkeypatch, parser_task_records):
+    tasks, document, job, session, engine = await _document_job_fixture(
+        parser_task_records,
+    )
+    raw_reason = "AnyDoc 不支持该文件：unsupported input at https://files.example/x?token=signed"
+
+    async def fake_prepare(path, settings, *, state=None, on_state=None, should_pause=None):
+        assert on_state is not None
+        await on_state(
+            {
+                "provider": "anydoc",
+                "signature": "anydoc-0.2.4-v1",
+                "status": "fallback_done",
+                "fallback": {
+                    "provider": "markitdown",
+                    "status": "done",
+                    "fallback_from": "anydoc",
+                    "anydoc_error": raw_reason,
+                },
+            }
+        )
+        return PreparedDocument(
+            f"{path}.parsed.markitdown.md",
+            "markitdown",
+            fallback_from="anydoc",
+            fallback_error=raw_reason,
+        )
+
+    monkeypatch.setattr(tasks, "prepare_document", fake_prepare)
+
+    await tasks._process_document_unlocked(session, job, engine_manager=engine, lease_lost=asyncio.Event())
+
+    assert document.parser_provider == "markitdown"
+    assert document.parser_status == "fallback"
+    assert document.fallback_from == "anydoc"
+    assert "signed" not in (document.fallback_reason or "")
+    assert "[URL REDACTED]" in document.fallback_reason
+    # AnyDoc 回退不应伪装成 MinerU 结果。
+    assert document.mineru_provider is None and document.mineru_model is None
+
+
+@pytest.mark.asyncio
+async def test_document_job_persists_plain_anydoc_failure_status(monkeypatch, parser_task_records):
+    """普通解析失败（非回退失败）也必须把 parser_status 落成 failed。
+
+    使用真实业务会话验证 UPDATE 已提交。
+    """
+    from sag_api.core.error_taxonomy import ErrorStage
+    from sag_api.core.errors import ValidationError as DomainValidationError
+    from sag_api.enums import DocumentStatus
+    from sag_api.jobs import tasks
+
+    session, document, _source, job = await parser_task_records(
+        {"filename": "scanned.pdf", "storage_path": "/uploads/scanned.pdf"}
+    )
+
+    async def fake_prepare(path, settings, *, state=None, on_state=None, should_pause=None):
+        assert on_state is not None
+        await on_state({"provider": "anydoc", "status": "running"})
+        raise DomainValidationError(
+            "AnyDoc 本地转换不做 OCR：第 2 页（共 3 页）需要 OCR",
+            stage=ErrorStage.PARSE,
+            retryable=False,
+        )
+
+    class FailingEngine(UncommittedDocumentManager):
+        async def process_document(self, *args, **kwargs):
+            await args[1](DocumentRequestBuilder(args[0]), *processing_parameters())
+            raise AssertionError("model execution must not run after parser failure")
+
+    monkeypatch.setattr(tasks, "prepare_document", fake_prepare)
+
+    with pytest.raises(DomainValidationError):
+        await tasks._process_document_unlocked(session, job, engine_manager=FailingEngine(), lease_lost=asyncio.Event())
+
+    await session.refresh(document)
+
+    assert document.status == DocumentStatus.FAILED
+    assert document.parser_status == "failed"
+    assert document.parser_provider == "anydoc"
+    assert document.fallback_from is None
+    assert document.error_stage == "parse"
+    assert "OCR" in document.error
+
+
+@pytest.mark.asyncio
+async def test_document_job_clears_previous_parser_result_before_reprocessing(monkeypatch, parser_task_records):
+    from sag_api.enums import DocumentStatus
+
+    tasks, document, job, session, engine = await _document_job_fixture(
+        parser_task_records,
+        document_overrides={
+            # 上一轮 AnyDoc 回退到 MarkItDown 的记录：本轮若不再回退，必须被清除。
+            "parser_provider": "markitdown",
+            "parser_status": "fallback",
+            "fallback_from": "anydoc",
+            "fallback_reason": "stale anydoc failure",
+            "status": DocumentStatus.PENDING,
+        },
+    )
+    seen_at_parse: list[tuple[Any, Any, Any]] = []
+
+    async def fake_prepare(path, settings, *, state=None, on_state=None, should_pause=None):
+        seen_at_parse.append((document.parser_provider, document.fallback_from, document.fallback_reason))
+        assert on_state is not None
+        await on_state({"provider": "anydoc", "status": "done"})
+        return PreparedDocument(f"{path}.parsed.anydoc-0.2.4-v1.md", "anydoc")
+
+    monkeypatch.setattr(tasks, "prepare_document", fake_prepare)
+
+    await tasks._process_document_unlocked(session, job, engine_manager=engine, lease_lost=asyncio.Event())
+
+    assert seen_at_parse == [(None, None, None)]
+    assert document.parser_provider == "anydoc"
+    assert document.parser_status == "done"
+    assert document.fallback_from is None and document.fallback_reason is None
+
+
+@pytest.mark.asyncio
+async def test_document_job_resume_preserves_saved_mineru_task(monkeypatch, parser_task_records):
+    tasks, document, job, session, engine = await _document_job_fixture(
+        parser_task_records, document_overrides={"filename": "report.pdf", "storage_path": "/uploads/report.pdf"}
+    )
+    monkeypatch.setattr(
+        "sag_api.core.config.settings",
+        _settings(document_parser="mineru", mineru_api_key="sk-test", mineru_base_url="https://example.test"),
+    )
+    saved = {
+        "provider": "mineru",
+        "status": "running",
+        "task_id": "existing-task",
+        "upload_url": "https://example.test/upload.pdf",
+        "batch_id": "existing-batch",
+    }
+    job.payload = {
+        "processing_identity": controller_processing_identity(document.storage_path),
+        "document_parser": dict(saved),
+    }
+    received = []
+
+    async def prepare(path, settings, *, state=None, **_kwargs):
+        assert path.endswith(".pdf") and settings.effective_document_parser == "mineru"
+        received.append(dict(state))
+        raise UpstreamError("stop after checking saved task")
+
+    monkeypatch.setattr(tasks, "prepare_document", prepare)
+
+    await session.commit()
+    with pytest.raises(UpstreamError, match="saved task"):
+        await tasks._process_document_unlocked(session, job, engine_manager=engine, lease_lost=asyncio.Event())
+
+    assert received == [saved]
+    assert job.payload["document_parser"] == saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        {"parser_provider": "anydoc", "parser_status": "done", "fallback_from": None},
+        {
+            "parser_provider": "markitdown",
+            "parser_status": "fallback",
+            "fallback_from": "mineru",
+            "fallback_reason": "previous remote failure",
+            "mineru_provider": "official",
+            "mineru_model": "vlm",
+        },
+    ],
+)
+async def test_document_job_chunk_resume_preserves_parser_result(monkeypatch, provenance, parser_task_records):
+    tasks, document, job, session, engine = await _document_job_fixture(
+        parser_task_records, document_overrides=provenance
+    )
+    job.payload = {
+        "processing_identity": controller_processing_identity(document.storage_path),
+        "process_request": document_request("sag-source-1", source_id="engine-doc").model_dump(mode="json"),
+        "control_revision": 1,
+    }
+
+    async def unexpected_prepare(*_args, **_kwargs):
+        pytest.fail("chunk resume must skip parsing")
+
+    monkeypatch.setattr(tasks, "prepare_document", unexpected_prepare)
+    await session.commit()
+    await tasks._process_document_unlocked(session, job, engine_manager=engine, lease_lost=asyncio.Event())
+
+    assert {field: getattr(document, field) for field in provenance} == provenance
+
+
+@pytest.mark.asyncio
+async def test_document_job_keeps_control_transition_state_during_parser_clear(monkeypatch, parser_task_records):
+    """文档已被并发置为 PAUSING 时，解析器清理不得覆盖控制状态与既有错误。"""
+    from sag_api.enums import DocumentStatus
+
+    tasks, document, job, session, engine = await _document_job_fixture(
+        parser_task_records,
+        document_overrides={
+            "status": DocumentStatus.PAUSING,
+            "error": "previous attempt failed",
+            "parser_provider": "markitdown",
+            "mineru_provider": "302",
+            "mineru_model": "2.5",
+            "parser_status": "fallback",
+            "fallback_from": "anydoc",
+            "fallback_reason": "stale anydoc failure",
+        },
+    )
+
+    async def fake_prepare(path, settings, *, state=None, on_state=None, should_pause=None):
+        assert document.status == DocumentStatus.PAUSING
+        assert document.error == "previous attempt failed"
+        assert document.parser_provider == "markitdown"
+        assert document.fallback_from == "anydoc"
+        # 暂停/删除意图下 on_parser_state 直接返回，不写解析状态。
+        assert on_state is not None
+        await on_state({"provider": "anydoc", "status": "done"})
+        assert document.parser_status == "fallback"
+        return PreparedDocument(f"{path}.parsed.anydoc-0.2.4-v1.md", "anydoc")
+
+    class RecordingEngine(UncommittedDocumentManager):
+        """暂停/删除在途文档仍会调用引擎，但引擎返回 paused 后必须落到暂停。"""
+
+        async def process_document(self, *args, **kwargs):
+            await args[1](DocumentRequestBuilder(args[0]), *processing_parameters())
+            return None
+
+    monkeypatch.setattr(tasks, "prepare_document", fake_prepare)
+    from sag_api.jobs.control import JobPaused
+
+    with pytest.raises(JobPaused):
+        await tasks._process_document_unlocked(
+            session, job, engine_manager=RecordingEngine(), lease_lost=asyncio.Event()
+        )
+
+    await session.refresh(document)
+    # 解析回调保留暂停意图；真正退出后清除旧失败并记录已完成的解析结果。
+    assert document.status == DocumentStatus.PAUSED
+    assert document.error is None
+    assert document.parser_provider == "anydoc"
+    assert document.fallback_from is None
+    assert document.parser_status == "done"
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        # 新格式：回退来源与目标都写在 fallback 里。
+        (
+            {
+                "provider": "anydoc",
+                "status": "fallback_done",
+                "fallback": {"provider": "markitdown", "fallback_from": "anydoc"},
+            },
+            ("fallback", "markitdown", "anydoc"),
+        ),
+        # 历史 MinerU 状态：来源只在顶层 provider 上，继续兼容。
+        (
+            {
+                "provider": "mineru",
+                "status": "fallback_done",
+                "fallback": {"provider": "markitdown", "mineru_error": "remote down"},
+            },
+            ("fallback", "markitdown", "mineru"),
+        ),
+        (
+            {
+                "provider": "anydoc",
+                "status": "fallback_failed",
+                "fallback": {
+                    "provider": "markitdown",
+                    "fallback_from": "anydoc",
+                    "anydoc_error": "unsupported",
+                    "markitdown_error": "local failed",
+                },
+            },
+            ("failed", "anydoc", "anydoc"),
+        ),
+        (
+            {
+                "provider": "mineru",
+                "status": "fallback_failed",
+                "fallback": {"provider": "markitdown", "mineru_error": "remote down"},
+            },
+            ("failed", "mineru", "mineru"),
+        ),
+    ],
+)
+def test_parser_state_values_keep_fallback_source_and_legacy_records(state, expected):
+    from sag_api.jobs import tasks
+
+    values = tasks._parser_state_values(state)
+
+    assert (
+        values["parser_status"],
+        values["parser_provider"],
+        values["fallback_from"],
+    ) == expected

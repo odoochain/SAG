@@ -1,13 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import type { BackgroundJob, Doc } from "./types";
-import enMessages from "../messages/en-US.json";
-import zhMessages from "../messages/zh-CN.json";
 import {
   beginDocumentMutation,
   deriveDocumentActivity,
   documentActivityLabelKey,
-  documentActivityShowsProgress,
   failedPollingDeadline,
   isCurrentDocumentSource,
   isLatestDocumentRefresh,
@@ -26,6 +23,7 @@ function document(overrides: Partial<Doc> = {}): Doc {
     content_type: "application/pdf",
     size_bytes: 1_024,
     status: "failed",
+    has_publication: false,
     chunk_count: 10,
     event_count: 4,
     progress: 52,
@@ -55,9 +53,10 @@ function job(overrides: Partial<BackgroundJob> = {}): BackgroundJob {
 }
 
 describe("document activity", () => {
-  it("describes deletion as immediate removal with automatic background cleanup", () => {
-    expect(zhMessages.DocumentList.deleting).toBe("文档已移除，后台清理将自动完成");
-    expect(enMessages.DocumentList.deleting).toBe("Document removed; background cleanup will finish automatically");
+  it("offers manual continuation without polling a paused cleanup receipt", () => {
+    expect(deriveDocumentActivity(document({ status: "deleting", deletion_job: job({ type: "delete_document", status: "paused" }) }))).toMatchObject({
+      phase: "delete-paused", busy: false, canDelete: true, poll: false,
+    });
   });
   it("keeps a failed checkpoint visible while requeueing", () => {
     const doc = document();
@@ -300,6 +299,54 @@ describe("document activity", () => {
     expect(shouldKeepDocumentMutation(document({ status: "paused" }), pausing)).toBe(false);
   });
 
+  it("keeps pause available while a reprocess retry is extracting", () => {
+    const retrying = document({ status: "failed", progress: 52 });
+    const mutation = beginDocumentMutation(retrying, "reprocess", 1_000);
+    const extracting = document({ status: "extracting", progress: 68, error: null });
+
+    // The reprocess overlay stays active for the whole extraction, so pause must
+    // not be gated on it; the worker still accepts a cooperative pause here.
+    expect(deriveDocumentActivity(extracting, mutation, 2_000)).toMatchObject({
+      busy: true,
+      canPause: true,
+    });
+  });
+
+  it("withholds pause until a requeued retry actually starts extracting", () => {
+    const retrying = document({ status: "failed", progress: 52 });
+    const mutation = beginDocumentMutation(retrying, "reprocess", 1_000);
+
+    expect(deriveDocumentActivity(retrying, mutation, 1_001)).toMatchObject({
+      phase: "requeueing",
+      canPause: false,
+    });
+    expect(
+      deriveDocumentActivity(document({ status: "pending", progress: 0 }), mutation, 1_200),
+    ).toMatchObject({ phase: "requeueing", canPause: true });
+  });
+
+  it("locks pause for the duration of a pause request and unlocks on the next state", () => {
+    const extracting = document({ status: "extracting", progress: 68 });
+    const pausing = beginDocumentMutation(extracting, "pause", 1_000);
+    const paused = document({ status: "paused", progress: 68, error: null });
+
+    expect(deriveDocumentActivity(extracting, pausing, 1_001)).toMatchObject({
+      phase: "pausing",
+      canPause: false,
+    });
+    expect(deriveDocumentActivity(paused, pausing, 2_000)).toMatchObject({
+      phase: "paused",
+      canPause: false,
+    });
+    expect(deriveDocumentActivity(paused, undefined, 2_000)).toMatchObject({
+      phase: "paused",
+      canPause: false,
+    });
+    expect(deriveDocumentActivity(document({ status: "ready" }), undefined, 2_000)).toMatchObject({
+      canPause: false,
+    });
+  });
+
   it("clears a pause overlay when the job completes or fails before pausing", () => {
     const started = beginDocumentMutation(
       document({ status: "extracting", progress: 80 }),
@@ -399,12 +446,4 @@ describe("document activity", () => {
     expect(documentActivityLabelKey("extracting")).toBe("extracting");
   });
 
-  it("shows progress for every non-terminal processing outcome including failure", () => {
-    expect(documentActivityShowsProgress("pending")).toBe(true);
-    expect(documentActivityShowsProgress("extracting")).toBe(true);
-    expect(documentActivityShowsProgress("failed")).toBe(true);
-    expect(documentActivityShowsProgress("paused")).toBe(true);
-    expect(documentActivityShowsProgress("ready")).toBe(false);
-    expect(documentActivityShowsProgress("deleting")).toBe(false);
-  });
 });

@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import Literal
 
-ModelProviderId = Literal["openai", "anthropic", "gemini"]
+ModelProviderId = Literal["openai", "anthropic", "gemini", "responses"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +48,7 @@ _PROVIDER_SPECS = (
         display_name="OpenAI-compatible",
         protocol="openai_chat_completions",
         litellm_prefix="openai",
-        default_model="qwen3.6-flash",
+        default_model="qwen3.8-flash",
         default_base_url="https://api.302ai.cn/v1",
         default_context_window=128_000,
         default_temperature=0.3,
@@ -81,6 +81,19 @@ _PROVIDER_SPECS = (
         temperature_configurable=True,
         can_reuse_embedding_credentials=False,
         api_key_placeholder="AIza…",
+    ),
+    ModelProviderSpec(
+        id="responses",
+        display_name="Responses API",
+        protocol="openai_responses",
+        litellm_prefix="sag_responses",
+        default_model="",
+        default_base_url=None,
+        default_context_window=128_000,
+        default_temperature=0.3,
+        temperature_configurable=True,
+        can_reuse_embedding_credentials=False,
+        api_key_placeholder="API key for the selected Responses endpoint",
     ),
 )
 

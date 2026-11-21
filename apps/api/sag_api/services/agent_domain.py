@@ -16,6 +16,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sag_api.branding import DEFAULT_AGENT_AVATAR, DEFAULT_AGENT_NAME
+from sag_api.core.attachments import attachment_path, media_type_for_attachment
 from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import ConflictError, NotFoundError, ValidationError
@@ -23,6 +24,8 @@ from sag_api.db.models import Agent, AgentBinding, Message, Source, Thread
 from sag_api.enums import BindingTargetType, MessageRole, MessageStatus
 from sag_api.generation import build_agent_messages, build_prompt_preview
 from sag_api.generation.prompt import estimate_tokens
+from sag_api.sag import EngineManager
+from sag_api.services.chatbot_service import query_operation
 from sag_api.services.source_service import search_source_candidates
 
 _DEFAULT_TITLES = {"新会话", "New chat"}
@@ -145,6 +148,8 @@ async def create_agent(session: AsyncSession, *, name: str, avatar: str = "", pe
     name = name.strip()
     if not name:
         raise ValidationError("Agent 名称不能为空")
+    if persona is not None and persona.get("search_strategy") == "multi_jev":
+        EngineManager.require_jev_capabilities(settings)
     agent = Agent(name=name, avatar=avatar or name[:1], persona=persona or {})
     session.add(agent)
     await session.commit()
@@ -161,6 +166,8 @@ async def update_agent(
     persona: dict | None = None,
 ) -> Agent:
     agent = await get_agent(session, agent_id)
+    if persona is not None and persona.get("search_strategy") == "multi_jev":
+        EngineManager.require_jev_capabilities(settings)
     if name is not None:
         agent.name = name
     if avatar is not None:
@@ -463,6 +470,7 @@ class AskPlan:
     citations: list[dict] = field(default_factory=list)
     prompt_preview: str = ""
     source_ids: list[str] | None = None  # @范围：限定循环内检索工具可见的信源
+    source_scope: list[dict[str, str]] | None = None
     user_message_id: str | None = None
 
 
@@ -492,6 +500,7 @@ def build_ask_context(
     )
 
 
+@query_operation
 async def prepare_ask(
     session: AsyncSession,
     *,
@@ -503,29 +512,26 @@ async def prepare_ask(
     llm=None,
 ) -> AskPlan:
     """落库用户消息（含图片附件 meta）、解析历史（超上下文阈值时主动压缩），组装计划。"""
-    from sag_api.api.v1.attachments import attachment_path
-
     resolved: list[dict] = []
     for aid in attachments or []:
         path = attachment_path(aid)
         if path is None:
             raise ValidationError(f"附件不存在或已过期：{aid}")
-        ext = aid.rsplit(".", 1)[-1].lower()
-        media_type = {
-            "png": "image/png",
-            "jpg": "image/jpeg",
-            "jpeg": "image/jpeg",
-            "webp": "image/webp",
-            "gif": "image/gif",
-        }.get(ext, "image/png")
+        media_type = media_type_for_attachment(aid)
         resolved.append({"id": aid, "media_type": media_type, "path": path})
 
+    selected_ids = list(dict.fromkeys(source_ids or []))
+    selected_sources = await search_source_candidates(session, selected_ids) if selected_ids else []
+    names_by_id = {source.id: source.name for source in selected_sources}
+    # Retain unavailable IDs too: a retry must never widen an explicit scope to default.
+    source_scope = [{"id": source_id, "name": names_by_id.get(source_id) or source_id} for source_id in selected_ids]
     user_msg = Message(
         thread_id=thread.id,
         role=MessageRole.USER,
         content=query,
         citations=[],
         attachments=[{k: a[k] for k in ("id", "media_type")} for a in resolved],
+        source_scope=source_scope,
     )
     session.add(user_msg)
     if thread.title in _DEFAULT_TITLES:
@@ -535,7 +541,10 @@ async def prepare_ask(
 
     history = await _history(session, thread.id, exclude_id=user_msg.id)
     # 历史预算 = 上下文窗口的 40%（其余留给工具轮/回答）
-    history = await compress_history(history, llm=llm, budget_tokens=int(settings.llm_context_window * 0.4))
+    from sag_api.services.chatbot_service import manager, operation
+
+    active = operation.get() or manager.snapshot()
+    history = await compress_history(history, llm=llm, budget_tokens=int(active.settings.llm_context_window * 0.4))
     plan = build_ask_context(
         agent=agent,
         query=query,
@@ -544,6 +553,7 @@ async def prepare_ask(
         source_ids=source_ids,
     )
     plan.user_message_id = user_msg.id
+    plan.source_scope = source_scope
     return plan
 
 

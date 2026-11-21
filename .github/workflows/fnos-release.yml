@@ -86,7 +86,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify-release-request.outputs.revision }}
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.10.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - id: policy
         name: Verify reviewed policy and raw OCI index
         shell: bash
@@ -142,7 +142,7 @@ jobs:
           test "$trivy_status" -eq 0
           test "$canonical_status" -eq 0
           test "$summary_status" -eq 0
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ always() }}
         with:
           name: fnos-gateway-scan-${{ github.run_id }}-${{ github.run_attempt }}
@@ -175,8 +175,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify-release-request.outputs.revision }}
-      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v3.6.0
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.10.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3.3.0
         with:
           registry: ghcr.io
@@ -184,7 +184,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: build
         name: Build and push an untagged immutable image index
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v6.17.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.context }}
           outputs: type=image,name-canonical=true,push-by-digest=true,push=true
@@ -202,7 +202,7 @@ jobs:
           set -euo pipefail
           test -n "${{ steps.build.outputs.digest }}"
           printf '%s\n' "${{ steps.build.outputs.digest }}" > "${{ matrix.name }}-digest.txt"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fnos-image-digest-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ matrix.name }}-digest.txt
@@ -226,13 +226,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify-release-request.outputs.revision }}
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.10.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3.3.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: fnos-image-digest-*
           merge-multiple: true
@@ -244,7 +244,7 @@ jobs:
           api_digest="$(node scripts/fnos-release-registry.mjs verify-digest --docker docker --image ghcr.io/zleap-ai/sag-api --digest "$(tr -d '\r\n' < API-digest.txt)" --revision "$CANDIDATE_REVISION" --version "$CANDIDATE_VERSION")"
           web_digest="$(node scripts/fnos-release-registry.mjs verify-digest --docker docker --image ghcr.io/zleap-ai/sag-web --digest "$(tr -d '\r\n' < Web-digest.txt)" --revision "$CANDIDATE_REVISION" --version "$CANDIDATE_VERSION")"
           node scripts/fnos-release-registry.mjs write-handoff --api-digest "$api_digest" --web-digest "$web_digest" --github-output "$GITHUB_OUTPUT" --artifact verified-digests.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fnos-verified-digests-${{ github.run_id }}-${{ github.run_attempt }}
           path: verified-digests.json
@@ -297,7 +297,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify-release-request.outputs.revision }}
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.10.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3.3.0
         with:
           registry: ghcr.io
@@ -323,7 +323,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify-release-request.outputs.revision }}
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.10.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Resolve immutable indexes without registry credentials
         shell: bash
         run: |
@@ -350,7 +350,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify-release-request.outputs.revision }}
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.10.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Resolve final tags and indexes without registry credentials
         shell: bash
         run: |
@@ -373,7 +373,7 @@ jobs:
         with:
           ref: ${{ needs.verify-release-request.outputs.revision }}
           fetch-depth: 0
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.10.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Install checksum-pinned fnpack
         shell: bash
         run: |
@@ -411,7 +411,7 @@ jobs:
           node scripts/fnos-release-manifest.mjs validate --input release/release-manifest.json
       - name: Upload one-day Candidate FPK
         if: ${{ inputs.mode == 'candidate' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sag-${{ needs.verify-release-request.outputs.version }}-candidate-${{ github.run_id }}
           path: |
@@ -432,7 +432,7 @@ jobs:
         with:
           ref: ${{ needs.verify-release-request.outputs.revision }}
           fetch-depth: 0
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.10.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Install checksum-pinned fnpack
         shell: bash
         run: |

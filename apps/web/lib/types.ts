@@ -16,7 +16,15 @@ export interface TokenResponse {
   user: User;
 }
 
-export type StorageChoice = "migrate" | "fresh";
+export type AuthMode = "local" | "password";
+
+export interface AuthStatus {
+  mode: AuthMode;
+  registration_required: boolean;
+  registration_open: boolean;
+}
+
+export type StorageChoice = "fresh";
 export type StorageBootstrapPhase =
   | "ready"
   | "choice_required"
@@ -40,11 +48,12 @@ export interface StorageBootstrapStatus {
   diagnostic_path?: string | null;
 }
 
-export type SourceStatus = "active" | "paused" | "error";
+export type SourceStatus = "active" | "paused" | "error" | "deleting" | "delete_failed";
 export type SourceType = "document" | "web" | "message" | "audio";
-export type DocumentParser = "auto" | "markitdown" | "mineru";
+export type DocumentParser = "auto" | "markitdown" | "mineru" | "anydoc";
 export type EffectiveDocumentParser = Exclude<DocumentParser, "auto">;
-export type ParserProvider = "mineru" | "markitdown" | "original";
+export type ParserProvider = "mineru" | "markitdown" | "anydoc" | "original";
+export type ParserFallbackSource = "mineru" | "anydoc";
 export type MineruProvider = "official" | "302";
 export type MineruModel = "vlm" | "pipeline" | "2.5";
 export type ParserStatus =
@@ -61,6 +70,7 @@ export interface Source {
   source_type: SourceType;
   connector_kind: string;
   status: SourceStatus;
+  deletion_job?: BackgroundJob | null;
   document_count: number;
   chunk_count: number;
   event_count: number;
@@ -94,9 +104,16 @@ export interface Doc {
   content_type: string;
   size_bytes: number;
   status: DocumentStatus;
+  /** A complete published version remains readable during candidate processing. */
+  has_publication: boolean;
+  deletion_job?: BackgroundJob | null;
   chunk_count: number;
   event_count: number;
   progress: number;
+  /** Current processing stage and observed chunk counts, separate from durable checkpoints. */
+  processing_stage?: string | null;
+  processed_chunks?: number | null;
+  total_chunks?: number | null;
   token_usage: number;
   error: string | null;
   /** 失败责任层（api / llm / engine / storage / network），仅失败时有值。 */
@@ -107,7 +124,7 @@ export interface Doc {
   mineru_provider?: MineruProvider | null;
   mineru_model?: MineruModel | null;
   parser_status?: ParserStatus | null;
-  fallback_from?: "mineru" | null;
+  fallback_from?: ParserFallbackSource | null;
   fallback_reason?: string | null;
   /** False when an OCTX package contains parsed content but not the original attachment bytes. */
   original_file_available?: boolean;
@@ -186,7 +203,8 @@ export interface Binding {
   config: Record<string, unknown>;
 }
 
-export type ModelProviderId = "openai" | "anthropic" | "gemini";
+export type ModelProviderId = "openai" | "anthropic" | "gemini" | "responses";
+export type ResponsesProviderId = "openai" | "azure" | "bedrock_runtime" | "bedrock_mantle";
 
 export interface ModelProviderSpec {
   id: ModelProviderId;
@@ -203,8 +221,39 @@ export interface ModelProviderSpec {
 
 export type MinerUProvider = "302" | "official";
 
+export interface ChatbotConnection {
+  enabled: boolean;
+  base_url: string;
+  api_key_set: boolean;
+  credential_source: string;
+  provider?: ModelProviderId;
+  responses_provider?: ResponsesProviderId;
+  responses_endpoint?: string;
+  responses_api_version?: string;
+  responses_send_temperature?: boolean;
+  model?: string;
+  schema_dimensions?: number;
+  request_dimensions?: number | null;
+}
+
+export interface ChatbotConfig {
+  locked: boolean;
+  encryption_configured: boolean;
+  llm: ChatbotConnection & { provider: ModelProviderId; model: string };
+  embedding: ChatbotConnection & { model: string; schema_dimensions: number; request_dimensions: number | null };
+}
+
+export interface ChatbotConfigPatch {
+  llm?: Partial<Pick<ChatbotConnection, "enabled" | "provider" | "base_url" | "model" | "responses_provider" | "responses_endpoint" | "responses_api_version" | "responses_send_temperature">> & { api_key?: string };
+  embedding?: Partial<Pick<ChatbotConnection, "enabled" | "base_url">> & { api_key?: string };
+}
+
 export interface ModelConfig {
   llm_provider: ModelProviderId;
+  llm_responses_provider?: ResponsesProviderId;
+  llm_responses_endpoint?: string;
+  llm_responses_api_version?: string;
+  llm_responses_send_temperature?: boolean;
   llm_base_url: string | null;
   llm_model: string;
   llm_context_window: number;
@@ -212,6 +261,7 @@ export interface ModelConfig {
   llm_max_tokens: number;
   llm_timeout_ms: number;
   llm_max_retries: number;
+  llm_structured_output_mode?: "auto" | "json_schema" | "json_object" | "prompt_only";
   llm_api_key_set: boolean;
   embedding_model: string;
   embedding_base_url: string | null;
@@ -228,6 +278,11 @@ export interface ModelConfig {
   document_chunk_max_tokens: number;
   document_chunk_mode: "standard" | "heading_strict";
   search_strategy: SearchStrategy;
+  jev_endpoint: string | null;
+  jev_model: string;
+  jev_api_key_set: boolean;
+  jev_ranking_timeout_seconds: number;
+  jev_failure_policy: "error" | "fallback_to_score";
   search_top_k: number;
   sag_language: "zh" | "en";
   sources: Partial<Record<Exclude<keyof ModelConfig, "sources" | "locked_fields">, "default" | "database" | "environment_policy">>;
@@ -236,6 +291,10 @@ export interface ModelConfig {
 
 export type ModelConfigPatch = Partial<{
   llm_provider: ModelConfig["llm_provider"];
+  llm_responses_provider: ResponsesProviderId;
+  llm_responses_endpoint: string;
+  llm_responses_api_version: string;
+  llm_responses_send_temperature: boolean;
   llm_base_url: string | null;
   llm_api_key: string;
   llm_model: string;
@@ -244,6 +303,7 @@ export type ModelConfigPatch = Partial<{
   llm_max_tokens: number;
   llm_timeout_ms: number;
   llm_max_retries: number;
+  llm_structured_output_mode?: "auto" | "json_schema" | "json_object" | "prompt_only";
   embedding_model: string;
   embedding_base_url: string;
   embedding_api_key: string;
@@ -258,6 +318,11 @@ export type ModelConfigPatch = Partial<{
   document_chunk_max_tokens: number;
   document_chunk_mode: "standard" | "heading_strict";
   search_strategy: SearchStrategy;
+  jev_endpoint: string | null;
+  jev_model: string;
+  jev_api_key: string;
+  jev_ranking_timeout_seconds: number;
+  jev_failure_policy: "error" | "fallback_to_score";
   search_top_k: number;
   sag_language: "zh" | "en";
 }>;
@@ -307,6 +372,13 @@ export interface KnowledgeMcpDescriptor {
   stdio: { command: string; args: string[]; env: Record<string, string>; note: string };
 }
 
+export interface DshIntegrationDescriptor {
+  schemaVersion: 1;
+  capabilities: string[];
+  upload: { maxMb: number; extensions: string[] };
+  defaultSourceId: string | null;
+}
+
 export interface Thread {
   id: string;
   agent_id: string;
@@ -337,6 +409,7 @@ export interface MessageStep {
       source_name?: string;
     }[];
     output_preview?: string;
+    retrieval_stats?: Record<string, unknown>;
   };
   ms?: number;
   count?: number;
@@ -357,6 +430,11 @@ export interface MessageError {
   [key: string]: unknown;
 }
 
+export interface MessageSourceScope {
+  id: string;
+  name: string;
+}
+
 export interface Message {
   id: string;
   thread_id: string;
@@ -364,6 +442,8 @@ export interface Message {
   content: string;
   citations: Citation[];
   attachments?: MessageAttachment[];
+  /** Explicit source snapshots; [] means default, null/absent means legacy unknown. */
+  source_scope?: MessageSourceScope[] | null;
   steps?: MessageStep[];
   prompt_preview?: string;
   status?: MessageStatus;
@@ -727,6 +807,10 @@ export interface ExplorationDetail {
 export interface Capabilities {
   llm_configured: boolean;
   llm_provider: ModelProviderId;
+  llm_responses_provider?: ResponsesProviderId;
+  llm_responses_endpoint?: string;
+  llm_responses_api_version?: string;
+  llm_responses_send_temperature?: boolean;
   llm_model: string;
   context_window?: number;
   embedding_model: string;
@@ -838,4 +922,16 @@ export interface OctxTransfer {
   cancellation_requested: boolean;
   created_at: string;
   updated_at: string;
+}
+
+
+export interface ClientAccessInfo {
+  protocol: "client-v1"; deployment: "standard" | "fnos"; server_id: string; api_url: string | null;
+  verification_uri: string | null; scope: string; access_days: number; refresh_days: number; absolute_days: number;
+}
+export interface ClientDevicePreview { client_name: string; user_code: string; scope: string; expires_in: number }
+export interface ClientAccessSession {
+  session_id: string; client_name: string; scope: string; generation: number;
+  access_expires_at: string; refresh_expires_at: string; absolute_expires_at: string;
+  revoked_at: string | null; last_used_at: string | null;
 }

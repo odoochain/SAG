@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,7 +15,10 @@ from sag_api.schemas.chunk import (
     OutlineOut,
     ReadResponse,
 )
-from sag_api.services.document_service import get_public_document
+from sag_api.services.document_service import get_public_document, read_document_lines
+from sag_api.services.insight_service import find_entity_context
+from sag_api.services.outline_service import build_outline, outline_rows
+from sag_api.services.retrieval_service import grep_published_chunks
 from sag_api.services.source_service import get_source
 
 router = APIRouter(prefix="/sources/{source_id}", tags=["knowledge"])
@@ -31,10 +32,10 @@ async def outline(
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> OutlineOut:
-    """文档大纲：标题 + chunk_id，按阅读顺序排列。"""
+    """文档大纲：标题 + chunk_id，按阅读顺序排列，并附带标题层级与章节路径。"""
     source = await get_source(session, source_id)
     document = await get_public_document(session, source, document_id)
-    if not document.sag_source_id:
+    if not document.has_publication:
         raise NotFoundError("文档尚无大纲，可能仍在处理中")
     rows = await engine_manager.list_chunk_headings(
         source.sag_source_config_id,
@@ -43,13 +44,15 @@ async def outline(
     )
     if not rows:
         raise NotFoundError("文档尚无大纲，可能仍在处理中")
+    markdown = await engine_manager.get_document_markdown(
+        source.sag_source_config_id,
+        document.sag_source_id,
+        source=source,
+    )
     return OutlineOut(
         document_id=document.id,
         filename=document.filename,
-        outline=[
-            {"rank": row["rank"], "heading": row["heading"], "chunk_id": row["chunk_id"]}
-            for row in rows
-        ],
+        outline=outline_rows(build_outline(markdown, rows)),
     )
 
 
@@ -64,12 +67,7 @@ async def grep(
 ) -> GrepResponse:
     """精确文本匹配：按原文字面内容查找，大小写不敏感。"""
     source = await get_source(session, source_id)
-    rows = await engine_manager.grep_chunks(
-        source.sag_source_config_id,
-        pattern,
-        source=source,
-        limit=limit,
-    )
+    rows = await grep_published_chunks(engine_manager, source, pattern, limit=limit)
     matches = [
         GrepMatchOut(
             chunk_id=row["chunk_id"],
@@ -89,17 +87,17 @@ async def read(
     limit: int = Query(default=120, ge=1, le=500),
     _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
+    engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> ReadResponse:
-    """按行分页读取原始文件。"""
+    """按行分页读取当前发布版本的正文。"""
     source = await get_source(session, source_id)
     document = await get_public_document(session, source, document_id)
-    if not document.storage_path or not os.path.isfile(document.storage_path):
-        raise NotFoundError("原始文件不存在或已清理")
     try:
-        with open(document.storage_path, encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
+        all_lines = await read_document_lines(document, source, engine_manager)
     except OSError as exc:
         raise NotFoundError("文件读取失败") from exc
+    if all_lines is None:
+        raise NotFoundError("文档尚无可读文本，可能仍在处理中或原始文件已清理")
     total = len(all_lines)
     start = max(0, offset - 1)
     page = all_lines[start : start + limit]
@@ -128,24 +126,10 @@ async def entity_context(
     target = name.strip()
     if not target:
         raise ValidationError("实体名称不能为空")
-    entities = await engine_manager.list_entities(
-        source.sag_source_config_id, source=source, limit=200
-    )
-    lowered = target.lower()
-    match = next(
-        (entity for entity in entities if (entity.name or "").lower() == lowered),
-        None,
-    )
-    if match is None:
-        match = next(
-            (entity for entity in entities if lowered in (entity.name or "").lower()),
-            None,
-        )
-    if match is None:
+    found = await find_entity_context(engine_manager, source, target)
+    if found is None:
         raise NotFoundError(f"未找到实体「{target}」")
-    snippets = await engine_manager.entity_context(
-        source.sag_source_config_id, match.id, source=source, limit=6
-    )
+    match, snippets = found
     context = "\n\n".join(snippets) if snippets else (match.description or "")
     return EntityContextOut(
         entity_id=match.id,

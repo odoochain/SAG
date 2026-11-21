@@ -32,6 +32,19 @@ async def _register(c, email):
     return {"Authorization": f"Bearer {r.json()['access_token']}"}
 
 
+def _initialize_request(client_name: str, request_id: int = 1) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": client_name, "version": "1.0"},
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_source_mcp_lists_and_calls_tools_over_engine():
     """知识库 MCP server：真实引擎 + 全库作用域，探索与检索工具均可调用。"""
@@ -107,7 +120,10 @@ async def test_source_mcp_lists_and_calls_tools_over_engine():
                     r_ls = await client.call_tool("list_documents", {})
                     assert "probe.md" in r_ls.content[0].text
                     r_read = await client.call_tool("read", {"document_id": doc["id"]})
-                    assert "hello mcp world" in r_read.content[0].text
+                    # Upload registration is not a publication. Published MCP
+                    # body reads are exercised against real SQL in test_document_read.
+                    assert "尚无可读文本" in r_read.content[0].text
+                    assert "hello mcp world" not in r_read.content[0].text
                     r_out = await client.call_tool("outline", {"document_id": doc["id"]})
                     assert isinstance(r_out.content[0].text, str)  # 处理中→占位文案亦可
                     r_grep = await client.call_tool("grep", {"pattern": "不存在的串xyz", "source_id": src["id"]})
@@ -409,28 +425,50 @@ async def test_mcp_binding_validation_and_source_descriptor():
             assert set(global_body["tools"]) == set(MCP_TOOL_NAMES)
             assert global_body["tool_details"] == list(MCP_TOOL_DETAILS)
 
-            unauthorized = await c.get("/mcp/")
+            scoped_mcp_url = f"/mcp/?source_id={src['id']}"
+            unauthorized = await c.post(
+                scoped_mcp_url,
+                headers={"Accept": "application/json, text/event-stream"},
+                json=_initialize_request("missing-token-test"),
+            )
             assert unauthorized.status_code == 401
 
-            initialized = await c.post(
+            invalid_connector = await c.post(
+                scoped_mcp_url,
+                headers={
+                    "Authorization": "Bearer sag_local_invalid",
+                    "Accept": "application/json, text/event-stream",
+                },
+                json=_initialize_request("invalid-connector-test"),
+            )
+            assert invalid_connector.status_code == 401
+
+            jwt_initialized = await c.post(
                 "/mcp/",
                 headers={
                     **A,
                     "Host": "192.168.1.20:8000",
                     "Accept": "application/json, text/event-stream",
                 },
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": {},
-                        "clientInfo": {"name": "lan-host-test", "version": "1.0"},
-                    },
-                },
+                json=_initialize_request("jwt-test"),
             )
-            assert initialized.status_code == 200, initialized.text
+            assert jwt_initialized.status_code == 200, jwt_initialized.text
+
+            connection = await c.get("/api/v1/system/dsh-connection")
+            connector_headers = {
+                "Authorization": f"Bearer {connection.json()['accessToken']}"
+            }
+
+            connector_initialized = await c.post(
+                scoped_mcp_url,
+                headers={
+                    **connector_headers,
+                    "Host": "192.168.1.20:8000",
+                    "Accept": "application/json, text/event-stream",
+                },
+                json=_initialize_request("connector-source-scope-test", request_id=2),
+            )
+            assert connector_initialized.status_code == 200, connector_initialized.text
 
             agent = (await c.post("/api/v1/agents", headers=A, json={"name": "挂载助手"})).json()
             ok = await c.post(

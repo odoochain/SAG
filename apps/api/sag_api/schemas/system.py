@@ -3,22 +3,39 @@ from __future__ import annotations
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
+from sag_api.core.config import MAX_JEV_RANKING_TIMEOUT_SECONDS, normalize_jev_endpoint
+from sag_api.core.embedding_presets import EmbeddingSetupProvider
 from sag_api.core.model_providers import ModelProviderId
+from sag_api.core.responses import ResponsesProviderId
 from sag_api.enums import SearchStrategy
 
 
 class QuickModelSetupRequest(BaseModel):
     api_key: str = Field(min_length=1, max_length=500)
+    embedding_provider: EmbeddingSetupProvider = "302"
+    embedding_api_key: str | None = Field(default=None, min_length=1, max_length=500)
 
-    @field_validator("api_key")
+    @field_validator("api_key", "embedding_api_key")
     @classmethod
-    def normalize_api_key(cls, value: str) -> str:
+    def normalize_api_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         value = value.strip()
         if not value:
             raise ValueError("API Key 不能为空")
         return value
+
+    @model_validator(mode="after")
+    def require_embedding_key(self) -> QuickModelSetupRequest:
+        if self.embedding_provider != "302" and not self.embedding_api_key:
+            raise ValueError("请为所选向量服务填写独立 API Key")
+        return self
+
+
+class DeepSeekQuickModelSetupRequest(QuickModelSetupRequest):
+    embedding_api_key: str = Field(min_length=1, max_length=500)
 
 
 class SystemPreferencesUpdate(BaseModel):
@@ -42,22 +59,33 @@ class ModelConfigUpdate(BaseModel):
     """
 
     llm_provider: ModelProviderId | None = None
+    llm_responses_provider: ResponsesProviderId | None = None
+    llm_responses_endpoint: str | None = Field(default=None, max_length=1000)
+    llm_responses_api_version: str | None = Field(default=None, max_length=100)
+    llm_responses_send_temperature: bool | None = None
     llm_base_url: str | None = Field(default=None, max_length=500)
-    llm_api_key: str | None = Field(default=None, max_length=500)
+    llm_api_key: str | None = Field(default=None, max_length=8192)
     llm_model: str | None = Field(default=None, min_length=1, max_length=200)
     llm_temperature: float | None = Field(default=None, ge=0, le=2)
     llm_max_tokens: int | None = Field(default=None, ge=1, le=32768)
     llm_context_window: int | None = Field(default=None, ge=1024, le=2_000_000)
     llm_timeout_ms: int | None = Field(default=None, ge=1_000, le=600_000)
     llm_max_retries: int | None = Field(default=None, ge=0, le=10)
+    llm_structured_output_mode: Literal["auto", "json_schema", "json_object", "prompt_only"] | None = None
 
     embedding_model: str | None = Field(default=None, min_length=1, max_length=200)
     embedding_base_url: str | None = Field(default=None, max_length=500)
     embedding_api_key: str | None = Field(default=None, max_length=500)
-    embedding_dimensions: int | None = Field(default=None, ge=1, le=8192)
+    embedding_dimensions: int | None = Field(default=None, ge=1, le=8192, strict=True)
 
-    document_parser: Literal["auto", "markitdown", "mineru"] | None = None
-    mineru_provider: Literal["302", "official"] | None = None
+    jev_endpoint: str | None = Field(default=None, max_length=1000)
+    jev_model: str | None = Field(default=None, min_length=1, max_length=200)
+    jev_api_key: str | None = Field(default=None, max_length=8192, repr=False)
+    jev_ranking_timeout_seconds: float | None = Field(default=None, ge=0.1, le=MAX_JEV_RANKING_TIMEOUT_SECONDS)
+    jev_failure_policy: Literal["error", "fallback_to_score"] | None = None
+
+    document_parser: Literal["auto", "markitdown", "mineru", "anydoc"] | None = None
+    mineru_provider: Literal["302", "official", "self_hosted"] | None = None
     mineru_base_url: str | None = Field(default=None, max_length=500)
     mineru_api_key: str | None = Field(default=None, max_length=500)
     mineru_version: Literal["2.0", "2.5"] | None = None
@@ -65,10 +93,42 @@ class ModelConfigUpdate(BaseModel):
     document_extract_concurrency: int | None = Field(default=None, ge=1, le=50)
     document_chunk_max_tokens: int | None = Field(default=None, ge=100, le=100_000)
     document_chunk_mode: Literal["standard", "heading_strict"] | None = None
+    document_extraction_profile: Literal["standard", "concise"] | None = None
 
     search_strategy: SearchStrategy | None = None
     search_top_k: int | None = Field(default=None, ge=1, le=50)
     sag_language: Literal["zh", "en"] | None = None
+
+    @field_validator("llm_model", "embedding_model")
+    @classmethod
+    def reject_blank_model(cls, value: str | None) -> str:
+        if value is None or not value.strip():
+            raise ValueError("Model name cannot be blank")
+        return value
+
+    @field_validator("jev_endpoint")
+    @classmethod
+    def validate_jev_endpoint(cls, value: str | None) -> str | None:
+        return normalize_jev_endpoint(value)
+
+    @field_validator("jev_model")
+    @classmethod
+    def validate_jev_model(cls, value: str | None) -> str:
+        if value is None or not value.strip():
+            raise ValueError("JEV 模型名称不能为空")
+        return value.strip()
+
+    @field_validator("jev_api_key")
+    @classmethod
+    def normalize_jev_api_key(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
+
+    @field_validator("jev_ranking_timeout_seconds", "jev_failure_policy")
+    @classmethod
+    def reject_null_jev_options(cls, value):
+        if value is None:
+            raise ValueError("JEV 精排时限与失败策略不能为 null")
+        return value
 
     @field_validator(
         "document_parser",
@@ -96,11 +156,37 @@ class ModelConfigUpdate(BaseModel):
             raise ValueError("切片模式不能为 null")
         return value
 
+    @field_validator("document_extraction_profile")
+    @classmethod
+    def reject_null_extraction_profile(cls, value: str | None) -> str:
+        if value is None:
+            raise ValueError("document_extraction_profile cannot be null")
+        return value
+
+    @field_validator("llm_structured_output_mode")
+    @classmethod
+    def reject_null_structured_output_mode(cls, value):
+        if value is None:
+            raise ValueError("Structured output mode cannot be null")
+        return value
+
     @field_validator("llm_timeout_ms", "llm_max_retries")
     @classmethod
     def reject_null_llm_resilience_fields(cls, value: int | None) -> int:
         if value is None:
             raise ValueError("模型超时与重试次数不能为 null")
+        return value
+
+    @field_validator(
+        "llm_responses_provider",
+        "llm_responses_endpoint",
+        "llm_responses_api_version",
+        "llm_responses_send_temperature",
+    )
+    @classmethod
+    def reject_null_responses_fields(cls, value):
+        if value is None:
+            raise ValueError("Responses configuration fields cannot be null")
         return value
 
     @field_validator("llm_provider")

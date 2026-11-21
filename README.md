@@ -9,14 +9,17 @@
 </p>
 
 <p align="center">
-  <a href="https://arxiv.org/abs/2608.12129"><img alt="Paper" src="https://img.shields.io/badge/paper-arXiv%3A2608.12129-18181b" /></a>
+  <a href="https://arxiv.org/abs/2606.15971"><img alt="Paper" src="https://img.shields.io/badge/paper-arXiv%3A2606.15971-18181b" /></a>
   <a href="https://pypi.org/project/zleap-sag/"><img alt="PyPI" src="https://img.shields.io/pypi/v/zleap-sag?label=zleap--sag&color=18181b" /></a>
-  <img alt="SAG version" src="https://img.shields.io/badge/SAG-v1.8.3-18181b" />
-  <a href="https://github.com/Zleap-AI/SAG/releases/latest"><img alt="Desktop release" src="https://img.shields.io/github/v/release/Zleap-AI/SAG?label=desktop&color=18181b" /></a>
+  <img alt="SAG version" src="https://img.shields.io/badge/SAG-v1.9.2-18181b" />
   <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776ab" />
   <img alt="Node" src="https://img.shields.io/badge/Node-20%2B-339933" />
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-18181b" /></a>
 </p>
+
+<blockquote>
+  <p align="center">Promotion: Our latest open-source knowledge base app, <strong><a href="https://github.com/Zleap-AI/SAG-Wiki">SAG-Wiki</a></strong>, is faster and lighter, powered by the all-new SAG2.</p>
+</blockquote>
 
 <p align="center"><strong>From now on, this is the only knowledge base app you need.</strong></p>
 
@@ -44,17 +47,7 @@ https://github.com/user-attachments/assets/ac805e3c-ab52-4857-bef6-2865f3831b2f
 
 ### Changelog
 
-**August 13, 2026**
-
-Added OCTX source import and export with integrity validation, conflict handling, failure recovery, and compatible vector reuse for cross-instance knowledge base migration and backup. This release also improves continuous Chinese-term retrieval and document lifecycle controls for more reliable fast search and background processing.
-
-**July 31, 2026**
-
-Published the official command-line client [`@zleap-ai/sag-cli`](docs/sag-cli.en.md). One command (`sag agent connect codex | claude-code`) mounts the SAG Knowledge MCP into Codex or Claude Code — no JWT copy-paste, no hand-edited config files. The MCP guide below now leads with the CLI.
-
-**July 14, 2026**
-
-Released a completely new version built on the `zleap-sag` package, featuring an entirely redesigned UI. The previous version has been archived in the `v1` branch and is no longer maintained.
+See [CHANGELOG.md](CHANGELOG.md) for release history and version-specific changes.
 
 ### SAG in one minute
 
@@ -73,7 +66,7 @@ Upload a document once. SAG parses it, splits it into chunks, embeds it, extract
 | Capability | What it gives you |
 | --- | --- |
 | Knowledge ingestion | File and web sources, document parsing, chunking, embedding, event/entity extraction, background processing |
-| Search | Global or source-scoped retrieval with Fast (`vector`) and Precise (`multi`) modes |
+| Search | Cross-source or source-scoped retrieval with Fast (`vector` / `multi_es_fast`), Precise (`multi`), and optional JEV reranking (`multi_jev`) modes |
 | Source tracing | Open any result or citation back to the exact original chunk |
 | Knowledge graph | Inspect events, entities, and their queryable associations |
 | Agent chat | Multi-turn answers grounded in selected sources, with clickable citations |
@@ -92,10 +85,10 @@ The product is deliberately local-first and single-user. It starts with SQLite a
 **SAG: SQL-Retrieval Augmented Generation with Query-Time Dynamic Hyperedges**<br>
 Yuchao Wu*, Junqin Li, XingCheng Liang, Yongjie Chen, Yinghao Liang, Linyuan Mo, and Guanxian Li
 
-[Read the paper](https://arxiv.org/abs/2608.12129) · [Reproduce the benchmark](https://github.com/Zleap-AI/SAG-Benchmark)
+[Read the paper](https://arxiv.org/abs/2606.15971) · [Reproduce the benchmark](https://github.com/Zleap-AI/SAG-Benchmark)
 
 <p align="center">
-  <a href="https://arxiv.org/abs/2608.12129">
+  <a href="https://arxiv.org/abs/2606.15971">
     <img src="docs/assets/readme/paper-first-page.png" alt="First page of the SAG paper" width="900" />
   </a>
 </p>
@@ -154,7 +147,7 @@ Full results:
   <img src="docs/assets/readme/main-result.png" alt="SAG benchmark results" width="940" />
 </p>
 
-See the [paper](https://arxiv.org/abs/2608.12129) and [SAG-Benchmark](https://github.com/Zleap-AI/SAG-Benchmark) for the full method and reproduction scripts.
+See the [paper](https://arxiv.org/abs/2606.15971) and [SAG-Benchmark](https://github.com/Zleap-AI/SAG-Benchmark) for the full method and reproduction scripts.
 
 ---
 
@@ -164,14 +157,16 @@ See the [paper](https://arxiv.org/abs/2608.12129) and [SAG-Benchmark](https://gi
 
 ### Desktop app (easiest)
 
-Download the latest desktop installer from [GitHub Releases](https://github.com/Zleap-AI/SAG/releases/latest):
+Download the latest desktop installer from [GitHub Releases](https://github.com/Zleap-AI/SAG/releases):
 
 | Platform | Download | Update behavior |
 | --- | --- | --- |
-| macOS 15+, Apple Silicon | `SAG-*-mac-arm64.dmg` | Signed, notarized, and updated through the stable channel |
-| Windows 10/11, x64 | `SAG-Setup-*-win-x64.exe` | Unsigned for now; Windows may show an unknown-publisher warning; stable automatic updates remain supported |
+| macOS 15+, Apple Silicon | `SAG-*-mac-arm64.dmg` | Signed and notarized; in-app updates require separate download and install confirmation |
+| Windows 10/11, x64 | `SAG-Setup-*-win-x64.exe` | Unsigned for now; Windows may show an unknown-publisher warning; in-app updates require separate download and install confirmation |
 
 The desktop app bundles the Web workspace and local knowledge backend, so users do not need to install Python, Node.js, or a database. Application updates preserve the knowledge base and uploads in the operating system's application-data directory. Release checksums are published as `SHA256SUMS.txt`.
+
+If SAG detects incompatible legacy knowledge data, it leaves that data unchanged until you confirm a backup and a fresh workspace. SAG does not automatically migrate or merge the old knowledge base; upload your documents again after setup. The backup remains available for manual recovery. Accounts and model settings are preserved, while previous knowledge bases, documents, agents, conversations and related tasks do not appear in the new workspace. Current-format workspaces continue using their existing data directories.
 
 ### Quick start (Docker, self-hosted)
 
@@ -191,9 +186,11 @@ No API key, Python runtime, Node runtime, or external database is required to bo
 On first launch:
 
 1. Enter your name to create or restore the local identity.
-2. Use the 302.AI quick setup, or open **Settings → Models** and configure any OpenAI-compatible LLM and embedding endpoint.
+2. Choose 302.AI or DeepSeek quick setup, or open **Settings → Models** to configure your model connections.
 3. Create a source, upload documents, and wait until their status is **Ready**.
 4. Search, open the original source, or start a cited conversation.
+
+DeepSeek uses Flash in non-thinking mode. Either setup supports embeddings from 302.AI, Zhipu, or Alibaba Cloud Bailian; enter a separate Key when using a different provider.
 
 The UI and services still start without model credentials. Embeddings are required for indexing/vector retrieval; the LLM is required for event extraction, query understanding, and generated answers.
 
@@ -201,11 +198,21 @@ The UI and services still start without model credentials. Embeddings are requir
 
 `SAG_LLM_*` values in Docker Compose or `.env` provide the initial model configuration. After an administrator saves model settings in the web UI, the persisted Settings value is used for subsequent extraction and generation jobs without a restart.
 
-To make the deployment configuration mandatory, set `SAG_LOCK_LLM_CONFIG=true`. SAG then shows the generation fields as locked in Settings and continues to use the `SAG_LLM_*` values. Change Docker Compose or `.env` and restart the API container to update a locked configuration. API keys remain deployment-managed and are never returned by the Settings API.
+New model setup suggests `qwen3.8-flash` for generation and `Qwen/Qwen3-Embedding-4B` for embeddings. Upgrades preserve saved model settings and explicit environment values; deployments without an explicit generation model retain the existing runtime default `qwen3.6-flash`. When upgrading an existing BGE index, retain `SAG_EMBEDDING_MODEL=bge-large-en-v1.5`. To switch models, wait for existing indexed documents to finish deleting, change the model, then import them again.
+
+To make the deployment configuration mandatory, set `SAG_LOCK_LLM_CONFIG=true`. SAG then shows the generation fields as locked in Settings and continues to use the `SAG_LLM_*` values. Change Docker Compose or `.env` and recreate the API container to update a locked configuration. API keys remain deployment-managed and are never returned by the Settings API.
+
+For separate chat and query endpoints, enable **Chatbot LLM** or **Query embedding** in the same Models page. Both are optional and leave document extraction/indexing on the original connections. Query embeddings share the original model and vector dimensions. See [optional chatbot connections](docs/chatbot-connections.md) for deployment settings, credential storage, and recovery.
+
+Select **OpenAI-compatible**, then choose the **Responses API** format for original generation or the optional chatbot LLM to use OpenAI-compatible, Azure, or Bedrock Responses endpoints. See [Responses API setup](docs/responses-api.md) for endpoint configuration, reasoning controls, authentication, and verification.
+
+Use **Test** to check an unsaved original or optional model connection before saving it. Success shows a green check with the model or embedding dimensions; failure shows a red error. Testing does not save the draft. Successful optional connection saves apply to subsequent operations, while operations already running keep their captured configuration. During background document processing, queries can reuse an initialized compatible engine to reduce waiting. See [optional chatbot connections](docs/chatbot-connections.md) for the runtime details.
 
 ### Import knowledge
 
 Create a source and add Markdown, text, PDF, Office, or other supported documents. SAG normalizes documents to Markdown, then runs chunking, embedding, event extraction, and entity extraction in the background.
+
+File uploads show actual transfer progress. The document list and details show the current processing stage and available chunk counts (for example, “Processed 810 / 2,033 chunks”), without an overall processing percentage. A document is ready to search when its status becomes **Ready**.
 
 <p align="center">
   <img src="docs/assets/readme/product-import.png" alt="Import a document into SAG" width="940" />
@@ -213,9 +220,13 @@ Create a source and add Markdown, text, PDF, Office, or other supported document
 
 PDF files use MinerU when it is configured and fall back to local MarkItDown when it is unavailable or fails. Other Office and text formats use MarkItDown by default.
 
+PDF parsing also supports a self-hosted MinerU 4.x V1 API (`mineru-kit api-server`). Configure `SAG_MINERU_PROVIDER=self_hosted`, `SAG_MINERU_BASE_URL`, and `SAG_DOCUMENT_PARSER=auto` or `mineru` using [`.env.example`](.env.example). Local or private-network endpoints also require `SAG_MINERU_ALLOW_PRIVATE_BASE_URL=true`. Recreate the API container after deployment changes. Previously saved parser/MinerU settings override environment defaults; update those saved values through authenticated `PUT /api/v1/system/model-config` and check the effective configuration before importing PDFs.
+
+You can also switch the parsing method to **AnyDoc** in settings (or set `SAG_DOCUMENT_PARSER=anydoc`): docx/pptx/epub/pdf/csv are converted on this machine by [AnyDoc](https://github.com/firecrawl/anydoc), nothing is uploaded, and no hosted OCR runs. XLS/XLSX retain local MarkItDown conversion to preserve Excel record groups and searchable chunks; the actual parser is recorded. Only files explicitly rejected as unsupported fall back to MarkItDown; other conversion errors are reported as failures. CSV is first decoded with SAG's encoding detection and normalized to UTF-8 before AnyDoc sees it, so non-UTF-8 Chinese CSV does not turn into mojibake. A scanned or image-only PDF is reported as needing OCR for the whole file (with page numbers) — switch to a configured MinerU and reprocess it; no partial text is cached. The default `auto` behaviour is unchanged.
+
 ### Search and verify the source
 
-Search globally or restrict the query to selected sources. Every result can open the original chunk beside the ranked result, so retrieval quality is inspectable before an Agent uses it.
+Search across sources or restrict the query to selected sources. Without an explicit selection, global search and default Agent retrieval use up to 16 candidate sources by default. Use `@` to target the sources you need. Every result can open the original chunk beside the ranked result, so retrieval quality is inspectable before an Agent uses it.
 
 <p align="center">
   <img src="docs/assets/readme/product-search.png" alt="Search results with original source tracing" width="940" />
@@ -223,7 +234,11 @@ Search globally or restrict the query to selected sources. Every result can open
 
 ### Ask with citations
 
-The default Agent searches the bound knowledge sources, streams the answer, and attaches clickable citations. The same conversation path is also available through an OpenAI-compatible endpoint.
+The Agent searches the knowledge sources in the current scope, streams the answer, and attaches clickable citations. The same conversation path is also available through an OpenAI-compatible endpoint.
+
+Select sources with `@` to narrow a question's knowledge scope. Each question keeps its selected-source badges in conversation history, and Retry reuses that saved scope. The badges show the selected search scope; the answer's citations show the evidence actually used. See [source scope in chat history](docs/chat-source-scope.md).
+
+Use **New conversation** in the sidebar to open a blank draft from any page. The draft stays selected when returning to chat, even while an older conversation finishes generating. Existing conversations remain in history; a new thread is saved when you send the first question. SAG generates one answer at a time, so wait for the ongoing answer to finish or stop it before sending in the new draft.
 
 <p align="center">
   <img src="docs/assets/readme/product-chat.png" alt="Agent answer with source citations" width="940" />
@@ -305,6 +320,20 @@ If you can't install the CLI, open **Settings → Integrations → Knowledge MCP
   <img src="docs/assets/readme/product-mcp.png" alt="SAG Knowledge MCP integration settings" width="940" />
 </p>
 
+### Use SAG in DeepSeek Harness
+
+Connect your SAG knowledge base to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) with `dsh-sag`. The current plugin, **dsh-sag 0.2.0**, supports **DeepSeek Harness 0.2.0-rc.2**.
+
+Start SAG. After dsh-sag 0.2.0 is published to npm, install and run the plugin:
+
+```sh
+dsh plugin --profile web add @zleap-ai/dsh-sag@0.2.0
+dsh plugin --profile web exec dsh-sag doctor
+dsh --profile web
+```
+
+Ask dsh: “Search SAG for the upload limit and cite the original text.” See the [plugin usage guide](integrations/dsh-sag/docs/usage.md) for connection options and supported capabilities.
+
 ### Use SAG as a model (OpenAI-compatible)
 
 SAG exposes an OpenAI Chat Completions endpoint with the same retrieval and citation behavior as the built-in chat:
@@ -346,17 +375,20 @@ Default persistence:
 
 ### Network and production safety
 
-The default Compose configuration binds ports 3000 and 8000 to `127.0.0.1`. SAG is currently a local, single-user product; do not expose those ports directly to the public internet.
+The default Compose configuration binds ports 3000 and 8000 to `127.0.0.1` and uses `SAG_AUTH_MODE=local`: the name is a local identity, not password authentication. Do not expose this default mode to an untrusted network.
 
 For custom ports or a trusted LAN address:
 
 ```bash
 cp .env.example .env
 # Edit BIND_ADDRESS, WEB_PORT, API_PORT, SAG_CORS_ORIGINS, and NEXT_PUBLIC_API_BASE.
+# For remote access, also set SAG_AUTH_MODE=password and keep SAG_ALLOW_REGISTRATION=false.
 docker compose up -d --build
 ```
 
-`NEXT_PUBLIC_API_BASE` is compiled into the web image, so changing it requires `--build`. A server deployment should add HTTPS and an external access-control layer such as VPN, IP allowlisting, or reverse-proxy authentication.
+On first launch, `password` mode guides you through creating an email and password. Later sign-ins require both credentials and never fall back to a name or the first user. `SAG_ALLOW_REGISTRATION=false` still permits the first credential account, then closes registration.
+
+`NEXT_PUBLIC_API_BASE` is compiled into the web image, so changing it requires `--build`. A server deployment should also use a strong `SAG_SECRET_KEY`, HTTPS, and protection such as VPN, IP allowlisting, or reverse-proxy rate limiting. The current `sag auth login --name` command is for `local` mode; with `password` mode, sign in through the web UI first and provide the issued token to the CLI through `SAG_TOKEN`.
 
 ---
 
@@ -391,6 +423,7 @@ apps/
     │   └── tools/          Built-in and remote MCP Agent tools
     └── sag_agent/          Framework-independent Agent runtime core
 deploy/                     Deployment initialization assets
+integrations/dsh-sag/       Independently published DeepSeek Harness plugin and embedded runtime
 docs/assets/readme/         README screenshots and diagrams
 ```
 
@@ -432,48 +465,52 @@ The Electron client packages the same Next.js application together with the loca
 
 ### Use `zleap-sag` directly
 
-[`zleap-sag`](https://pypi.org/project/zleap-sag/) is the continuously maintained Python engine behind the SAG application. Distribution name: `zleap-sag`; import path: `zleap.sag`; Python: 3.11+; license: MIT. The application currently requires `zleap-sag>=0.7.1`.
+[`zleap-sag`](https://pypi.org/project/zleap-sag/) is the continuously maintained Python engine behind the SAG application. Distribution name: `zleap-sag`; import path: `zleap.sag`; Python: 3.11+; license: MIT. The application currently requires `zleap-sag==0.15.0`.
 
 Install the zero-infrastructure local stack:
 
 ```bash
-pip install zleap-sag
+pip install zleap-sag==0.15.0
 ```
 
-Then run the complete ingest → extract → search lifecycle:
+With an existing `knowledge.md` and working model credentials, run the complete ingest → extract → search lifecycle:
 
 ```python
 import asyncio
+from pathlib import Path
 
 from zleap.sag import DataEngine, EngineConfig
 from zleap.sag.config import EmbeddingConfig, LLMConfig
+from zleap.sag.pipeline import SearchOptions, SearchRequest, SearchScope
 
 
 async def main() -> None:
     config = EngineConfig(
+        storage_mode="normal",
         llm=LLMConfig(
             api_key="sk-...",
             base_url="https://your-openai-compatible-host/v1",
-            model="qwen3.6-flash",
+            model="qwen3.8-flash",
         ),
         # When api_key/base_url are omitted, embedding reuses the LLM endpoint.
-        embedding=EmbeddingConfig(model="bge-large-en-v1.5"),
+        embedding=EmbeddingConfig(model="Qwen/Qwen3-Embedding-4B"),
         language="en",
     )
 
     # One DataEngine instance represents one logical data source.
-    async with DataEngine(config) as engine:
-        ingest = await engine.ingest("knowledge.md")
-        extract = await engine.extract()
-        result = await engine.search(
-            "Why is SAG effective for multi-hop retrieval?",
-            strategy="multi",
-            top_k=5,
+    async with DataEngine(config, data_source_id="knowledge-demo") as engine:
+        chunks = await engine.ingest(Path("knowledge.md"))
+        events = await engine.extract(chunks)
+        request = SearchRequest(
+            query="Why is SAG effective for multi-hop retrieval?",
+            scope=SearchScope(data_source_ids=(chunks.data_source_id,)),
+            options=SearchOptions(strategy="full_expand", top_k=5, return_type="chunk"),
         )
+        result = await engine.search(request)
 
-        print(ingest.chunk_count, extract.event_count)
-        for section in result.sections:
-            print(section.get("content", "")[:200])
+        print(chunks.chunk_count, events.event_count)
+        for hit in result.chunks:
+            print(hit.content[:200])
 
 
 asyncio.run(main())
@@ -487,16 +524,17 @@ Use one configuration style, not both:
 
 | Style | Construction | Best for |
 | --- | --- | --- |
-| Parameter injection | `EngineConfig(llm=..., embedding=...)` | Libraries, notebooks, explicit application wiring |
+| Parameter injection | `EngineConfig(storage_mode="normal", llm=..., embedding=...)` | Libraries, notebooks, explicit application wiring |
 | Environment | `EngineConfig.from_env()` or `from_env(env_file=".env")` | Containers and 12-factor services |
 
 Minimal environment configuration:
 
 ```bash
+export SAG_STORAGE_MODE=normal
 export OPENAI_API_KEY=sk-...
 export OPENAI_BASE_URL=https://your-openai-compatible-host/v1
-export LLM_MODEL=qwen3.6-flash
-export EMBEDDING_MODEL=bge-large-en-v1.5
+export LLM_MODEL=qwen3.8-flash
+export EMBEDDING_MODEL=Qwen/Qwen3-Embedding-4B
 ```
 
 ```python
@@ -513,22 +551,29 @@ config = EngineConfig.from_env()
 | --- | --- |
 | `await engine.start()` | Initialize connections; local SQLite/LanceDB schema is created automatically |
 | `await engine.aclose()` | Close engine resources; handled automatically by `async with` |
-| `await engine.chunk(source)` | Parse and chunk a path or raw string without persisting it |
-| `await engine.ingest(path, ...)` | Parse one document, chunk it, embed it, and persist chunks/vectors |
-| `await engine.extract(...)` | Extract and persist the event-entity index for the current source |
-| `await engine.search(query, strategy=..., top_k=...)` | Return a typed `SearchResult` with `sections` and timing/statistics |
+| `await engine.parse(source, options=None)` | Parse a `FileSource`, `TextSource`, or other `SourceInput` into a `ParsedSource` without persisting it |
+| `await engine.chunk(parsed, options=None)` | Chunk a `ParsedSource` into a `ChunkSet` without persisting it |
+| `await engine.ingest(source, ...)` | Parse, chunk, embed, and persist a path, text, or `SourceInput`; return a `ChunkSetRef` |
+| `await engine.extract(target, options=None)` | Extract and persist events/entities from a `ChunkSetRef` or `PersistedChunkSelector`; return an `EventSetRef` |
+| `await engine.search(request)` | Search with an explicit `SearchRequest` (query, scope, options); return a `SearchResult` with `chunks`, `events`, and `stats` |
 | `await engine.init_schema()` | Idempotently initialize production schemas; not needed for the default local stack |
 
-Typed results are available from `zleap.sag.results`: `ChunkResult`, `IngestResult`, `ExtractResult`, and `SearchResult`. All engine exceptions derive from `SagError`, so application boundaries can catch one base type.
+Pipeline request and result types are available from `zleap.sag.pipeline`: `ParsedSource`, `ChunkSet`, `ChunkSetRef`, `EventSetRef`, `SearchRequest`, and `SearchResult`. All engine exceptions derive from `SagError` in `zleap.sag.exceptions`, so application boundaries can catch one base type.
 
 #### Retrieval modes
 
-| UI label | Python strategy | Implementation |
+| UI label | App/API strategy | Implementation |
 | --- | --- | --- |
-| Fast (default) | `vector` | Direct retrieval by semantic similarity for a faster response |
+| Fast (vector) | `vector` | Direct retrieval by semantic similarity for a faster response |
+| Fast (multi_es-fast) | `multi_es_fast` | BM25 entity recall and event multi-hop retrieval, skipping LLM reranking |
 | Precise | `multi` | Combines entity relationships with LLM reranking for more complete results |
+| JEV reranking | `multi_jev` | Scores recalled and graph-expanded evidence through an independent JEV service |
 
-The UI exposes only **Fast** and **Precise** retrieval modes. Precise maps to SAG's `multi` strategy and does not run a separate GraphRAG implementation.
+These are the application/API strategy names; the application maps `multi` to the Python engine's `full_expand` and `multi_es_fast` to `pruned_expand_rff`. Availability depends on storage capabilities: `multi_es_fast` requires lexical search support.
+
+Configure 302.AI, TypeSafe, or a custom JEV service in **Settings → Knowledge → Retrieval** (default model: `jev-latest`, separate API key), then select **JEV reranking**. Saving the service alone does not enable it. The default deadline is 30 seconds; failures return an error unless coarse fallback is enabled.
+
+Supported on LanceDB and Elasticsearch; pgvector is currently unsupported. PostgreSQL relational storage can use JEV with a supported vector backend. Existing retrieval settings remain until JEV is selected; documents do not need reindexing. See the [benchmark results and cost estimates](CHANGELOG.md#jev-reranking).
 
 #### Storage backends
 
@@ -539,7 +584,7 @@ The UI exposes only **Fast** and **Precise** retrieval modes. Precise maps to SA
 | Production split | MySQL/PostgreSQL/OceanBase | Elasticsearch | `zleap-sag[mysql]`, `[postgres]`, `[es]` |
 | Single database | OceanBase 4.3.3+ | OceanBase vector | `zleap-sag[mysql]` |
 
-Changing `EngineConfig` changes the backend without changing ingest/extract/search calls. Current engine connections are process-global, so use one `EngineConfig` per process.
+Changing `EngineConfig` changes the backend without changing ingest/extract/search calls. Each `DataEngine` instance owns its connections and resources; close it with `async with` or `aclose()`.
 
 For the full package configuration, extras, examples, and changelog, see the [`zleap-sag` package page](https://pypi.org/project/zleap-sag/).
 
@@ -556,7 +601,7 @@ The self-hosted API is available after starting SAG:
 | OpenAPI schema | [http://localhost:8000/openapi.json](http://localhost:8000/openapi.json) |
 | MCP Streamable HTTP | `http://localhost:8000/mcp/` |
 
-This is a **self-hosted API**, not a hosted public cloud API. Most routes require a SAG JWT:
+This is a **self-hosted API**, not a hosted public cloud API. In the default `local` mode, most routes use a SAG JWT issued after name login:
 
 ```bash
 curl -s http://localhost:8000/api/v1/auth/login \
@@ -568,6 +613,14 @@ Copy `access_token` from the response and send it as:
 
 ```http
 Authorization: Bearer <SAG_TOKEN>
+```
+
+With `SAG_AUTH_MODE=password`, create the first credential through `POST /auth/register`, then sign in with email and password:
+
+```bash
+curl -s http://localhost:8000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"owner@example.com","password":"<YOUR_PASSWORD>"}'
 ```
 
 #### API map

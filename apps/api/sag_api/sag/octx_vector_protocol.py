@@ -42,8 +42,8 @@ ROLE_RECIPES: dict[str, dict[str, Any]] = {
 ROLE_STORAGE = {
     "chunk.heading": ("source_chunks", "heading_vector"),
     "chunk.content": ("source_chunks", "content_vector"),
-    "event.title": ("event_vectors", "title_vector"),
-    "event.content": ("event_vectors", "content_vector"),
+    "event.title": ("event_vectors_wide", "title_vector"),
+    "event.content": ("event_vectors_wide", "content_vector"),
     "entity.name": ("entity_vectors", "vector"),
     "event_entity.relation": ("event_entity_vectors", "vector"),
 }
@@ -56,6 +56,32 @@ _CANONICALIZATION = {
     "null_as": "",
     "trim": False,
 }
+
+_VECTOR_IDENTITY_KEY = "octx_vector_identity"
+_VECTOR_IDENTITY_STATE_KEY = "octx_vector_identity_state"
+_EMPTY = "empty"
+_KNOWN = "known"
+_MIXED = "mixed"
+
+
+def _vector_backend(vector_store: Any) -> Any:
+    """Return the provider behind runtime limit and compatibility wrappers."""
+    backend = vector_store
+    seen: set[int] = set()
+    while id(backend) not in seen:
+        seen.add(id(backend))
+        inner = getattr(backend, "inner", None)
+        if inner is not None:
+            backend = inner
+            continue
+        raw = getattr(backend, "_raw", None)
+        if callable(raw):
+            unwrapped = raw()
+            if unwrapped is not backend:
+                backend = unwrapped
+                continue
+        break
+    return backend
 
 
 def _canonical_text(value: object) -> str:
@@ -120,13 +146,149 @@ def embedding_identity(embedding_client: Any) -> dict[str, Any] | None:
     }
 
 
+def _configured_dimension(settings: Any) -> int | None:
+    """当前配置生效的向量维度；完全拿不到时为 None。
+
+    0.13.0 起 schema 维度是建库与返回向量校验的唯一依据，且 SAG 总会为它取到具体
+    值（未配置时默认 1024）——「向量空间未知」这个状态已经不存在。因此优先取生效
+    值；只带旧字段的桩对象（如测试替身）才走显式字段回退，全都缺失时返回 None 并
+    保守地禁用复用。
+    """
+    for attribute in (
+        "effective_embedding_schema_dimensions",
+        "embedding_request_dimensions",
+        "embedding_schema_dimensions",
+        "embedding_dimensions",
+    ):
+        value = getattr(settings, attribute, None)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def configured_embedding_identity(settings: Any) -> dict[str, Any] | None:
+    """由当前配置解析 embedding 身份，供 OCTX 向量复用比对。
+
+    身份必须来自配置：``engine.resources.embedding`` 是
+    ``LimitedEmbeddingAdapter``，它不代理 ``model`` / ``base_url`` / 维度，
+    从运行时对象读取只会拿到默认值（并且不会报错）。
+    """
     class Configuration:
         model = settings.embedding_model
         base_url = settings.effective_embedding_base_url
-        dimensions = settings.embedding_dimensions
+        dimensions = _configured_dimension(settings)
 
     return embedding_identity(Configuration())
+
+
+def initialize_vector_identity_state(
+    source_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Mark a brand-new source partition as empty without mutating its config."""
+    initialized = dict(source_config or {})
+    initialized[_VECTOR_IDENTITY_STATE_KEY] = _EMPTY
+    initialized.pop(_VECTOR_IDENTITY_KEY, None)
+    return initialized
+
+
+def _complete_vector_identity(identity: dict[str, Any] | None) -> bool:
+    if not isinstance(identity, dict):
+        return False
+    try:
+        dimensions = int(identity.get("dimensions") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        str(identity.get("model") or "").strip()
+        and dimensions > 0
+        and identity.get("dtype") == "float32"
+        and isinstance(identity.get("normalized"), bool)
+        and (identity.get("revision") or identity.get("model_fingerprint"))
+    )
+
+
+def _assign_vector_identity_config(source: Any, updated: dict[str, Any]) -> bool:
+    current = dict(getattr(source, "config", None) or {})
+    if current == updated:
+        return False
+    source.config = updated
+    return True
+
+
+def apply_vector_identity_record(source: Any, identity: dict[str, Any] | None) -> bool:
+    """Conservatively observe one successful document vector write."""
+    current = dict(getattr(source, "config", None) or {})
+    state = current.get(_VECTOR_IDENTITY_STATE_KEY)
+    recorded = current.get(_VECTOR_IDENTITY_KEY)
+
+    # Existing records produced before the state marker are trustworthy; an
+    # entirely absent legacy record is unknown and must never be promoted by a
+    # partial document observation.
+    if state is None:
+        state = _KNOWN if isinstance(recorded, dict) else _MIXED
+
+    if state == _EMPTY and _complete_vector_identity(identity):
+        current[_VECTOR_IDENTITY_STATE_KEY] = _KNOWN
+        current[_VECTOR_IDENTITY_KEY] = dict(identity or {})
+    elif (
+        state == _KNOWN
+        and _complete_vector_identity(identity)
+        and isinstance(recorded, dict)
+        and recorded == identity
+    ):
+        current[_VECTOR_IDENTITY_STATE_KEY] = _KNOWN
+        current[_VECTOR_IDENTITY_KEY] = recorded
+    else:
+        current[_VECTOR_IDENTITY_STATE_KEY] = _MIXED
+        current.pop(_VECTOR_IDENTITY_KEY, None)
+    return _assign_vector_identity_config(source, current)
+
+
+def reconcile_vector_identity_records(
+    source: Any,
+    identities: list[dict[str, Any] | None],
+) -> bool:
+    """Derive the export identity from every qualified published document.
+
+    Legacy documents have ``None`` until they are reprocessed.  A source can
+    therefore recover from ``mixed`` only after every exported document has a
+    complete, identical identity; one unknown or different document keeps
+    reuse disabled.
+    """
+    current = dict(getattr(source, "config", None) or {})
+    if not identities:
+        current[_VECTOR_IDENTITY_STATE_KEY] = _EMPTY
+        current.pop(_VECTOR_IDENTITY_KEY, None)
+        return _assign_vector_identity_config(source, current)
+
+    first = identities[0]
+    compatible = _complete_vector_identity(first) and all(
+        _complete_vector_identity(identity) and identity == first
+        for identity in identities
+    )
+    if compatible:
+        current[_VECTOR_IDENTITY_STATE_KEY] = _KNOWN
+        current[_VECTOR_IDENTITY_KEY] = dict(first or {})
+    else:
+        current[_VECTOR_IDENTITY_STATE_KEY] = _MIXED
+        current.pop(_VECTOR_IDENTITY_KEY, None)
+    return _assign_vector_identity_config(source, current)
+
+
+def replace_vector_identity_record(source: Any, identity: dict[str, Any] | None) -> bool:
+    """Record the identity after a complete active partition replacement."""
+    current = dict(getattr(source, "config", None) or {})
+    if _complete_vector_identity(identity):
+        current[_VECTOR_IDENTITY_STATE_KEY] = _KNOWN
+        current[_VECTOR_IDENTITY_KEY] = dict(identity or {})
+    else:
+        current[_VECTOR_IDENTITY_STATE_KEY] = _MIXED
+        current.pop(_VECTOR_IDENTITY_KEY, None)
+    return _assign_vector_identity_config(source, current)
 
 
 def vector_profile(role: str, embedding_client: Any, dimensions: int) -> dict[str, Any]:
@@ -272,7 +434,7 @@ async def _iter_lancedb_vector_batches(
         return
     if routing:
         escaped_routing = routing.replace("'", "''")
-        predicate = f"source_config_id = '{escaped_routing}'"
+        predicate = f"data_source_id = '{escaped_routing}'"
     else:
         if records_by_local_id is None:
             raise ValueError("LanceDB manifest export requires source routing")
@@ -329,9 +491,13 @@ async def _fetch_vector_fields(
     custom = getattr(vector_store, "fetch_vector_fields", None)
     if callable(custom):
         return dict(await custom(index, record_ids, fields))
-    module = type(vector_store).__module__
+    backend = _vector_backend(vector_store)
+    custom = getattr(backend, "fetch_vector_fields", None)
+    if callable(custom):
+        return dict(await custom(index, record_ids, fields))
+    module = type(backend).__module__
     if module.endswith("lancedb_store"):
-        table = await vector_store._open_table(index)
+        table = await backend._open_table(index)
         if table is None:
             return {}
         quoted = ",".join("'" + record_id.replace("'", "''") + "'" for record_id in record_ids)
@@ -345,10 +511,10 @@ async def _fetch_vector_fields(
         statement = text(
             f"SELECT {quote}id{quote}, {columns} FROM {quote}{index}{quote} WHERE {quote}id{quote} IN :record_ids"
         ).bindparams(bindparam("record_ids", expanding=True))
-        async with vector_store._engine().connect() as connection:
+        async with backend._engine().connect() as connection:
             result = await connection.execute(statement, {"record_ids": record_ids})
             return {str(row._mapping["id"]): dict(row._mapping) for row in result}
-    client = getattr(vector_store, "client", None)
+    client = getattr(backend, "client", None)
     mget = getattr(client, "mget", None)
     if callable(mget):
         documents = [
@@ -393,7 +559,12 @@ async def write_existing_vector_payload(
     vectors_dir.mkdir(exist_ok=False)
     profiles: list[dict[str, Any]] = []
     written_roles: set[str] = set()
-    lance_arrow_native = type(vector_store).__module__.endswith("lancedb_store")
+    try:
+        vector_backend = _vector_backend(vector_store)
+    except Exception as error:
+        logger.warning("OCTX vector backend inspection failed error=%s", error)
+        vector_backend = vector_store
+    lance_arrow_native = type(vector_backend).__module__.endswith("lancedb_store")
     manifest = VectorExportManifest(manifest_path) if manifest_path is not None else None
     role_rows = _role_records(root) if manifest is None else {role: [] for role in ROLE_TARGETS}
     try:
@@ -418,7 +589,7 @@ async def write_existing_vector_payload(
                     }
                     completed = 0
                     vector_batches = _iter_lancedb_vector_batches(
-                        vector_store,
+                        vector_backend,
                         index,
                         vector_field,
                         role=role,
@@ -569,6 +740,12 @@ async def write_existing_vector_payload(
                     writer.close()
                 sink.close()
             if not complete or dimension is None:
+                logger.warning(
+                    "OCTX vector role export incomplete role=%s exported=%s expected=%s",
+                    role,
+                    completed,
+                    total,
+                )
                 output_path.unlink(missing_ok=True)
                 continue
             profiles.append(vector_profile_from_identity(role, export_identity, dimension))

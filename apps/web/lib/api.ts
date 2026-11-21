@@ -1,15 +1,24 @@
+import { resolveApiBase } from "./api-base";
 import { clearToken, getToken } from "./auth";
 import { getDiagnosticsStore } from "./diagnostics";
+import { generateUuidV4 } from "./uuid";
 import { readClientLocale } from "../i18n/client";
 import { clientErrorMessage, serverErrorMessage } from "../i18n/client-errors";
 import type { SearchStrategy } from "./retrieval-config";
 import type {
   ActivityItem,
+  ClientAccessInfo,
+  ClientAccessSession,
+  ClientDevicePreview,
+  AuthStatus,
   Entity,
   Agent,
   Binding,
   BindingTargetType,
   Capabilities,
+  ChatbotConfig,
+  ChatbotConfigPatch,
+  DshIntegrationDescriptor,
   Doc,
   MessagePage,
   ModelConfig,
@@ -40,26 +49,9 @@ import type {
   OctxTransfer,
 } from "./types";
 
-/** 浏览器通过局域网 IP 打开前端时，自动将 API 指向同主机 8000 端口。 */
-function resolveApiBase(): string {
-  const configured = process.env.NEXT_PUBLIC_API_BASE;
-  if (typeof window !== "undefined") {
-    const { protocol, hostname } = window.location;
-    const isLocalHost = hostname === "localhost" || hostname === "127.0.0.1";
-    if (!isLocalHost) {
-      const pointsToLocal =
-        !configured ||
-        configured.includes("localhost") ||
-        configured.includes("127.0.0.1");
-      if (pointsToLocal) {
-        return `${protocol}//${hostname}:8000`;
-      }
-    }
-  }
-  return configured || "http://localhost:8000";
-}
+export type QuickSetupEmbeddingProvider = "302" | "zhipu" | "bailian";
 
-export const API_BASE = resolveApiBase();
+export const API_BASE = resolveApiBase(process.env.NEXT_PUBLIC_API_BASE);
 
 export class ApiError extends Error {
   status: number;
@@ -72,12 +64,17 @@ export class ApiError extends Error {
   stage?: string;
   /** 是否可安全重试。 */
   retryable?: boolean;
+  restartReason?: string;
+  confirmationToken?: string;
   constructor(
     status: number,
     code: string,
     message: string,
     requestId?: string,
-    dimensions?: { layer?: string; stage?: string; retryable?: boolean },
+    dimensions?: {
+      layer?: string; stage?: string; retryable?: boolean;
+      restartReason?: string; confirmationToken?: string;
+    },
   ) {
     super(message);
     this.status = status;
@@ -86,6 +83,8 @@ export class ApiError extends Error {
     this.layer = dimensions?.layer;
     this.stage = dimensions?.stage;
     this.retryable = dimensions?.retryable;
+    this.restartReason = dimensions?.restartReason;
+    this.confirmationToken = dimensions?.confirmationToken;
   }
 }
 
@@ -151,6 +150,11 @@ type SearchStreamTimeout = "first-result" | "idle";
 
 const SEARCH_FIRST_RESULT_TIMEOUT_MS = 30_000;
 const SEARCH_STREAM_IDLE_TIMEOUT_MS = 45_000;
+
+function usesServerSearchDeadline(strategy?: SearchStrategy): boolean {
+  // An omitted strategy may inherit JEV from the global configuration.
+  return strategy === undefined || strategy === "multi_jev";
+}
 
 function isSearchResponse(value: unknown): value is SearchResponse {
   if (!value || typeof value !== "object") return false;
@@ -220,7 +224,9 @@ async function streamGlobalSearch(
         : clientErrorMessage("searchIdleTimeout"),
     );
 
-  armStreamTimeout("first-result", SEARCH_FIRST_RESULT_TIMEOUT_MS);
+  if (!usesServerSearchDeadline(body.strategy)) {
+    armStreamTimeout("first-result", SEARCH_FIRST_RESULT_TIMEOUT_MS);
+  }
   const searchStartMs = Date.now();
   let response: Response;
   try {
@@ -437,10 +443,12 @@ async function streamGlobalSearch(
 
 interface RequestOptions extends RequestInit {
   redirectOnUnauthorized?: boolean;
+  /** null delegates the deadline to a bounded server operation; caller abort still applies. */
+  timeoutMs?: number | null;
 }
 
 async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
-  const { redirectOnUnauthorized = true, ...requestInit } = opts;
+  const { redirectOnUnauthorized = true, timeoutMs = 30_000, ...requestInit } = opts;
   const token = getToken();
   const headers: Record<string, string> = {
     ...(requestInit.headers as Record<string, string>),
@@ -452,11 +460,10 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   if (!headers["Accept-Language"])
     headers["Accept-Language"] = readClientLocale();
 
-  // 30s 超时护栏（SSE 流式接口不走此函数，不受影响）
-  const timeoutSignal = AbortSignal.timeout(30_000);
-  const signal = requestInit.signal
-    ? AbortSignal.any([requestInit.signal, timeoutSignal])
-    : timeoutSignal;
+  const timeoutSignal = timeoutMs === null ? undefined : AbortSignal.timeout(timeoutMs);
+  const signal = timeoutSignal
+    ? requestInit.signal ? AbortSignal.any([requestInit.signal, timeoutSignal]) : timeoutSignal
+    : requestInit.signal;
 
   const method = requestInit.method ?? "GET";
   const startMs = Date.now();
@@ -465,8 +472,10 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     res = await fetch(`${API_BASE}${path}`, { ...requestInit, headers, signal });
   } catch (e) {
     const durationMs = Date.now() - startMs;
-    const isTimeout = e instanceof DOMException && e.name === "TimeoutError";
-    const isAbort = e instanceof DOMException && e.name === "AbortError";
+    const isAbort = Boolean(requestInit.signal?.aborted)
+      || (e instanceof DOMException && e.name === "AbortError");
+    const isTimeout = !isAbort && (Boolean(timeoutSignal?.aborted)
+      || (e instanceof DOMException && e.name === "TimeoutError"));
     getDiagnosticsStore().record("error", {
       source: "api",
       method,
@@ -474,7 +483,7 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
       duration_ms: durationMs,
       error_code: isTimeout ? "timeout" : isAbort ? "aborted" : "network",
       error_message: isTimeout
-        ? "Request timed out after 30s"
+        ? timeoutMs === null ? "Request deadline exceeded" : `Request timed out after ${timeoutMs / 1000}s`
         : isAbort
           ? "Request was cancelled"
           : "Network error — server unreachable or DNS failure",
@@ -506,6 +515,8 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     let layer: string | undefined;
     let stage: string | undefined;
     let retryable: boolean | undefined;
+    let restartReason: string | undefined;
+    let confirmationToken: string | undefined;
     try {
       const j = await res.json();
       if (j?.error) {
@@ -514,6 +525,8 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
         layer = j.error.layer ?? undefined;
         stage = j.error.stage ?? undefined;
         retryable = typeof j.error.retryable === "boolean" ? j.error.retryable : undefined;
+        restartReason = typeof j.error.restart_reason === "string" ? j.error.restart_reason : undefined;
+        confirmationToken = typeof j.error.confirmation_token === "string" ? j.error.confirmation_token : undefined;
       } else if (j?.detail) {
         message =
           typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
@@ -540,7 +553,7 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
       code,
       serverErrorMessage(code, message, res.status),
       requestId,
-      { layer, stage, retryable },
+      { layer, stage, retryable, restartReason, confirmationToken },
     );
   }
 
@@ -611,7 +624,7 @@ async function startOctxDocumentExport(
   documentId: string,
   version?: string,
 ): Promise<OctxTransfer> {
-  const transferId = crypto.randomUUID().replaceAll("-", "");
+  const transferId = generateUuidV4().replaceAll("-", "");
   const submit = () =>
     request<OctxTransfer>(
       `/api/v1/sources/${sourceId}/documents/${documentId}/octx-exports`,
@@ -643,12 +656,13 @@ async function startOctxDocumentExport(
 
 export const api = {
   // auth / system
+  authStatus: () => request<AuthStatus>("/api/v1/auth/status"),
   register: (b: { email: string; password: string; name?: string }) =>
     request<TokenResponse>("/api/v1/auth/register", {
       method: "POST",
       body: JSON.stringify(b),
     }),
-  login: (b: { name: string; email?: string; password?: string }) =>
+  login: (b: { name?: string; email?: string; password?: string }) =>
     request<TokenResponse>("/api/v1/auth/login", {
       method: "POST",
       body: JSON.stringify(b),
@@ -674,17 +688,54 @@ export const api = {
     }),
 
   // 模型与检索配置
+  getChatbotConfig: () =>
+    request<{ config: ChatbotConfig }>("/api/v1/system/chatbot-config"),
+  saveChatbotConfig: (b: ChatbotConfigPatch) =>
+    request<{ config: ChatbotConfig }>("/api/v1/system/chatbot-config", {
+      method: "PUT",
+      body: JSON.stringify(b),
+    }),
+  testChatbotConfig: (b: ChatbotConfigPatch & { target: "llm" | "embedding" }) =>
+    request<{ ok: boolean; message: string }>("/api/v1/system/chatbot-config/test", {
+      method: "POST",
+      body: JSON.stringify(b),
+    }),
   getModelConfig: () => request<ModelConfig>("/api/v1/system/model-config"),
   getModelProviders: () =>
     request<ModelProviderSpec[]>("/api/v1/system/model-providers"),
   modelSetupStatus: () =>
     request<ModelSetupStatus>("/api/v1/system/model-setup"),
-  quickSetup302: (apiKey: string) =>
+  quickSetup302: (
+    apiKey: string,
+    embedding?: { provider: QuickSetupEmbeddingProvider; apiKey: string },
+  ) =>
     request<{ config: ModelConfig; capabilities: Capabilities }>(
       "/api/v1/system/model-setup/302",
       {
         method: "POST",
-        body: JSON.stringify({ api_key: apiKey }),
+        body: JSON.stringify({
+          api_key: apiKey,
+          ...(embedding ? {
+            embedding_provider: embedding.provider,
+            embedding_api_key: embedding.apiKey,
+          } : {}),
+        }),
+      },
+    ),
+  quickSetupDeepSeek: (
+    apiKey: string,
+    embeddingApiKey: string,
+    embeddingProvider?: QuickSetupEmbeddingProvider,
+  ) =>
+    request<{ config: ModelConfig; capabilities: Capabilities }>(
+      "/api/v1/system/model-setup/deepseek",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          api_key: apiKey,
+          embedding_api_key: embeddingApiKey,
+          ...(embeddingProvider ? { embedding_provider: embeddingProvider } : {}),
+        }),
       },
     ),
   saveModelConfig: (b: ModelConfigPatch) =>
@@ -700,12 +751,35 @@ export const api = {
       "/api/v1/system/model-config/mineru/302",
       { method: "POST" },
     ),
+  clientAccessInfo: () => request<ClientAccessInfo>("/api/v1/client-access/info"),
+  clientAccessSessions: () => request<ClientAccessSession[]>("/api/v1/client-access/sessions"),
+  clientAccessDevice: (user_code: string) => request<ClientDevicePreview>("/api/v1/client-access/inspect", { method: "POST", body: JSON.stringify({ user_code }) }),
+  approveClientAccess: (user_code: string, approve: boolean) => request<{ approved: boolean }>(
+    "/api/v1/client-access/approve", { method: "POST", body: JSON.stringify({ user_code, approve }) }),
+  revokeClientAccess: (id: string) => request<void>(`/api/v1/client-access/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }),
   testModelConfig: (b?: ModelConfigPatch) =>
-    request<{ ok: boolean; message: string }>(
+    request<{ ok: boolean; message: string; completion?: { ok: boolean }; structured?: { ok: boolean; mode: string } }> (
       "/api/v1/system/model-config/test",
       {
         method: "POST",
         body: b ? JSON.stringify(b) : undefined,
+      },
+    ),
+  testEmbeddingModelConfig: (b?: Pick<ModelConfigPatch,
+    "embedding_model" | "embedding_base_url" | "embedding_api_key" | "embedding_dimensions">) =>
+    request<{ ok: boolean; message: string; dimensions?: number }>(
+      "/api/v1/system/model-config/embedding/test",
+      { method: "POST", body: JSON.stringify(b ?? {}) },
+    ),
+  testJevModelConfig: (b: ModelConfigPatch, signal?: AbortSignal) =>
+    request<{ ok: boolean; message: string }>(
+      "/api/v1/system/model-config/jev/test",
+      {
+        method: "POST", body: JSON.stringify(b), signal,
+        // Leave transport time around an explicit draft limit. Omitted values
+        // inherit server settings, so their deadline must be resolved there too.
+        timeoutMs: b.jev_ranking_timeout_seconds === undefined
+          ? null : b.jev_ranking_timeout_seconds * 1000 + 5_000,
       },
     ),
 
@@ -723,7 +797,7 @@ export const api = {
       body: JSON.stringify(b),
     }),
   deleteSource: (id: string) =>
-    request<{ ok: boolean }>(`/api/v1/sources/${id}`, { method: "DELETE" }),
+    request<BackgroundJob>(`/api/v1/sources/${id}`, { method: "DELETE" }),
   syncSource: (id: string) =>
     request<{ id: string; type: string }>(`/api/v1/sources/${id}/sync`, {
       method: "POST",
@@ -795,9 +869,10 @@ export const api = {
       body: fd,
     });
   },
-  reprocessDocument: (sid: string, did: string) =>
+  reprocessDocument: (sid: string, did: string, confirmationToken?: string) =>
     request<BackgroundJob>(`/api/v1/sources/${sid}/documents/${did}/reprocess`, {
       method: "POST",
+      body: confirmationToken === undefined ? undefined : JSON.stringify({ confirmation_token: confirmationToken }),
     }),
   pauseDocument: (sid: string, did: string) =>
     request<BackgroundJob>(`/api/v1/sources/${sid}/documents/${did}/pause`, {
@@ -808,7 +883,7 @@ export const api = {
       method: "POST",
     }),
   deleteDocument: (sid: string, did: string) =>
-    request<{ ok: boolean; detail: string }>(`/api/v1/sources/${sid}/documents/${did}`, { method: "DELETE" }),
+    request<BackgroundJob>(`/api/v1/sources/${sid}/documents/${did}`, { method: "DELETE" }),
 
   // Agent
   listAgents: () => request<Agent[]>("/api/v1/agents"),
@@ -937,6 +1012,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(b),
       signal,
+      timeoutMs: usesServerSearchDeadline(b.strategy) ? null : undefined,
     }),
   streamGlobalSearch,
   evalCompare: (b: EvalCompareBody, signal?: AbortSignal) =>
@@ -944,6 +1020,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(b),
       signal,
+      timeoutMs: b.strategies.includes("multi_jev") ? null : undefined,
     }),
 
   // 知识宇宙：统计轮廓 + 原子时间线与显式探索
@@ -1094,6 +1171,40 @@ export const api = {
 
   // 整个 SAG 知识库的 MCP 挂载信息
   knowledgeMcp: () => request<KnowledgeMcpDescriptor>("/api/v1/system/mcp"),
+
+  // DeepSeek Harness 本机连接
+  dshIntegration: () => request<DshIntegrationDescriptor>("/api/v1/system/dsh"),
+  updateDshIntegration: (defaultSourceId: string | null) =>
+    request<DshIntegrationDescriptor>("/api/v1/system/dsh/settings", {
+      method: "PUT",
+      body: JSON.stringify({ default_source_id: defaultSourceId }),
+    }),
+  regenerateDshToken: () =>
+    request<DshIntegrationDescriptor>("/api/v1/system/dsh/regenerate", {
+      method: "POST",
+    }),
+  downloadDshConnection: async (): Promise<Blob> => {
+    const token = getToken();
+    const res = await fetch(`${API_BASE}/api/v1/system/dsh/export`, {
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        "Accept-Language": readClientLocale(),
+      },
+    });
+    if (!res.ok) {
+      let code = "download_failed";
+      let message = res.statusText || clientErrorMessage("requestFailed");
+      try {
+        const body = await res.json();
+        code = body?.error?.code ?? code;
+        message = body?.error?.message ?? message;
+      } catch {
+        /* ignore */
+      }
+      throw new ApiError(res.status, code, message);
+    }
+    return res.blob();
+  },
 
   // OCTX 数据包导入/导出
   startOctxExport,

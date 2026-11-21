@@ -58,7 +58,8 @@ jobs:
   macos:
     name: macOS 15 · Apple Silicon · signed + notarized
     if: github.repository == 'Zleap-AI/SAG'
-    needs: [quality, metadata]
+    # Build in parallel with quality checks; publish still requires every gate.
+    needs: [metadata]
     runs-on: macos-15
     timeout-minutes: 120
     environment: desktop-release
@@ -82,20 +83,7 @@ jobs:
               exit 1
             }
           done
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: |
-            apps/web/package-lock.json
-            apps/desktop/package-lock.json
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.11"
-      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
-        with:
-          enable-cache: true
-          cache-dependency-glob: apps/api/uv.lock
+      - uses: ./.github/actions/setup-desktop-build
       - name: Verify native Apple Silicon toolchain
         shell: bash
         run: |
@@ -108,18 +96,20 @@ jobs:
             exit 1
           }
           python -c 'import platform; raise SystemExit(0 if platform.machine() == "arm64" else "Python must be arm64")'
-      - name: Install Web dependencies
-        working-directory: apps/web
-        run: npm ci
-      - name: Install desktop dependencies
+      # Keep phases separate so Actions reports each duration. Signing secrets
+      # remain scoped to the final package step, never the preparation steps.
+      - name: Compile Electron
         working-directory: apps/desktop
-        run: npm ci
-      - name: Install frozen backend dependencies
-        working-directory: apps/api
-        run: uv sync --frozen --extra desktop
-      - name: Prepare macOS release payload without signing credentials
+        run: npm run build
+      - name: Build desktop Web
         working-directory: apps/desktop
-        run: npm run prepare:release
+        run: npm run build:web
+      - name: Freeze Python backend
+        working-directory: apps/desktop
+        run: npm run build:backend
+      - name: Assemble release resources
+        working-directory: apps/desktop
+        run: npm run prepare:resources
       - name: Build signed and notarized macOS release
         working-directory: apps/desktop
         env:
@@ -149,7 +139,7 @@ jobs:
             exit 1
           }
       - name: Upload macOS release payload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-macos-arm64
           path: |
@@ -164,7 +154,7 @@ jobs:
   windows:
     name: Windows 2025 · x64 · unsigned
     if: github.repository == 'Zleap-AI/SAG'
-    needs: [quality, metadata]
+    needs: [metadata]
     runs-on: windows-2025
     timeout-minutes: 120
     env:
@@ -172,32 +162,19 @@ jobs:
       SAG_UPDATE_GITHUB_REPOSITORY: ${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: |
-            apps/web/package-lock.json
-            apps/desktop/package-lock.json
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.11"
-      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
-        with:
-          enable-cache: true
-          cache-dependency-glob: apps/api/uv.lock
-      - name: Install Web dependencies
-        working-directory: apps/web
-        run: npm ci
-      - name: Install desktop dependencies
+      - uses: ./.github/actions/setup-desktop-build
+      - name: Compile Electron
         working-directory: apps/desktop
-        run: npm ci
-      - name: Install frozen backend dependencies
-        working-directory: apps/api
-        run: uv sync --frozen --extra desktop
-      - name: Prepare Windows release payload
+        run: npm run build
+      - name: Build desktop Web
         working-directory: apps/desktop
-        run: npm run prepare:release
+        run: npm run build:web
+      - name: Freeze Python backend
+        working-directory: apps/desktop
+        run: npm run build:backend
+      - name: Assemble release resources
+        working-directory: apps/desktop
+        run: npm run prepare:resources
       - name: Build unsigned Windows release
         working-directory: apps/desktop
         run: npm run package:win
@@ -222,7 +199,7 @@ jobs:
             throw "latest.yml does not describe $env:RELEASE_VERSION"
           }
       - name: Upload Windows release payload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-windows-x64
           path: |
@@ -236,7 +213,7 @@ jobs:
   publish:
     name: Publish immutable GitHub Release
     if: github.repository == 'Zleap-AI/SAG' && github.event_name == 'push'
-    needs: [metadata, macos, windows]
+    needs: [quality, metadata, macos, windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -247,7 +224,7 @@ jobs:
       - name: Revalidate immutable newest release tag
         shell: bash
         run: node scripts/release-public.mjs --verify-latest "$GITHUB_REF_NAME" "$GITHUB_SHA"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: release-*
           path: release-assets
@@ -288,7 +265,7 @@ jobs:
             '## Downloads' \
             '- **macOS Apple Silicon:** download the `.dmg` installer.' \
             '- **Windows x64:** download the `Setup.exe` installer. It is currently unsigned, so Windows may show an unknown-publisher warning.' \
-            '- Existing desktop installations receive this release through the stable automatic-update channel.' \
+            '- Desktop updates require choosing Download, then Restart and install. Older clients first receive the compatible bridge release.' \
             '' \
             '## Changes' > release-notes.md
           node scripts/release-public.mjs --notes "$GITHUB_REF_NAME" >> release-notes.md
@@ -298,9 +275,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          gh release create "$GITHUB_REF_NAME" release-assets/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --latest \
-            --title "SAG $GITHUB_REF_NAME" \
-            --notes-file release-notes.md
+          node scripts/desktop-update-feed.mjs "$GITHUB_REF_NAME" release-assets release-notes.md

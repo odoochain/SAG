@@ -6,9 +6,11 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from zleap.sag import DataEngine
 
 from sag_api.core.config import settings
 from sag_api.runtime import KnowledgeRuntime
+from sag_api.sag.config_builder import build_engine_config
 from sag_api.upgrades.active_engine import ActiveEngineStore
 from sag_api.upgrades.contracts import (
     StorageBootstrapPhase,
@@ -16,8 +18,17 @@ from sag_api.upgrades.contracts import (
     StorageChoice,
 )
 from sag_api.upgrades.coordinator import StorageBootstrapCoordinator
-from sag_api.upgrades.state import BootstrapState
-from sag_api.upgrades.types import StorageLayout, StorageVersion
+from sag_api.upgrades.state import BootstrapState, BootstrapStateStore
+from sag_api.upgrades.types import StorageLayout
+from tests.document_requests import processing_parameters
+
+
+@pytest.fixture
+async def settings_store():
+    """Lifespan still reads DSH settings when bootstrap's own init is replaced."""
+    from sag_api.core.db import init_db
+
+    await init_db()
 
 
 class _LifecycleDependency:
@@ -47,9 +58,16 @@ class _JobQueue(_LifecycleDependency):
 
 
 class _EngineManager:
-    def __init__(self, factory: _RuntimeFactory, active_path: Path) -> None:
+    def __init__(self, factory: _RuntimeFactory, active_path: Path, runtime_settings) -> None:
         self.factory = factory
         self.active_path = active_path
+        self.settings = runtime_settings
+
+    async def apply_settings(self, settings, *, reset_engines):
+        for field_name in settings.__class__.model_fields:
+            setattr(self.settings, field_name, getattr(settings, field_name))
+        if reset_engines:
+            await self.aclose_all()
 
     async def aclose_all(self) -> None:
         self.factory.calls.append("engine_manager.stop")
@@ -84,10 +102,10 @@ class _RuntimeFactory:
     def uninstall_litellm_policy(self, _policy) -> None:
         self.calls.append("policy.uninstall")
 
-    def create_engine_manager(self, _settings, active_path: Path):
+    def create_engine_manager(self, runtime_settings, active_path: Path):
         self.engine_manager_count += 1
         self.active_paths.append(active_path)
-        return _EngineManager(self, active_path)
+        return _EngineManager(self, active_path, runtime_settings)
 
     def create_llm_client(self, _settings):
         self.calls.append("llm.create")
@@ -233,7 +251,8 @@ async def test_coordinator_retry_drains_retained_runtime_before_replacement(
             phase=StorageBootstrapPhase.PROCESSING,
             source_version="current",
             target_version="0.8.2",
-            choice=StorageChoice.MIGRATE,
+            choice=StorageChoice.FRESH,
+            rebuild_confirmed=True,
             stage="verified",
         )
     )
@@ -246,12 +265,8 @@ async def test_coordinator_retry_drains_retained_runtime_before_replacement(
         "knowledge runtime startup failed (2 sub-exceptions)"
     )
 
-    async def current_probe():
-        return SimpleNamespace(version=StorageVersion.CURRENT)
-
-    coordinator._probe = current_probe
     retry_start = len(factory.calls)
-    await coordinator.choose(StorageChoice.MIGRATE, "owner")
+    await coordinator.choose(StorageChoice.FRESH, "owner")
     await coordinator.wait()
 
     assert factory.calls[retry_start] == "agent_runtime.stop"
@@ -363,6 +378,84 @@ async def test_runtime_resets_cached_engines_after_engine_settings_change(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reset_engines", [True, False])
+async def test_runtime_settings_update_waits_for_real_document_admission(tmp_path, monkeypatch, reset_engines):
+    """Publishing settings before the writer lock mixes new options with an old engine."""
+    from contextlib import asynccontextmanager
+
+    from sag_api.sag.engine_manager import EngineManager, _Slot
+
+    class Factory(_RuntimeFactory):
+        def create_engine_manager(self, runtime_settings, active_path):
+            return EngineManager(runtime_settings)
+
+    runtime = KnowledgeRuntime(settings, object(), active_path=tmp_path / "active", factory=Factory())
+    app = SimpleNamespace(state=SimpleNamespace(), source_mcp=None)
+    await runtime.start(app)
+    manager = app.state.engine_manager
+    events = []
+
+    class Engine:
+        async def aclose(self):
+            events.append("closed")
+
+    old_slot = _Slot(engine=Engine(), config=processing_parameters()[0])
+    manager._slots["source"] = old_slot
+    entered, release, writer_requested = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_write = manager._lifecycle_gate.write
+
+    @asynccontextmanager
+    async def observe_write():
+        writer_requested.set()
+        async with original_write():
+            yield
+
+    monkeypatch.setattr(manager._lifecycle_gate, "write", observe_write)
+
+    async def document_execution():
+        async with manager.use_concurrently("source"):
+            entered.set()
+            await release.wait()
+            events.append("released")
+
+    old_model, old_top_k = runtime._settings.llm_model, runtime._settings.search_top_k
+    update_values = {"llm_model": "replacement-model"} if reset_engines else {"search_top_k": 17}
+    update_task = None
+    writer_signal = None
+    execution = asyncio.create_task(document_execution())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        update_task = asyncio.create_task(runtime.apply_settings(
+            settings.model_copy(update=update_values), reset_engines=reset_engines,
+        ))
+        # The false branch used to publish without ever requesting a writer.
+        writer_signal = asyncio.create_task(writer_requested.wait())
+        await asyncio.wait([writer_signal, update_task], timeout=1, return_when=asyncio.FIRST_COMPLETED)
+        assert writer_requested.is_set()
+        assert runtime._settings.llm_model == old_model
+        assert runtime._settings.search_top_k == old_top_k
+        assert manager._slots["source"] is old_slot and events == []
+        assert not update_task.done()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(execution, update_task), timeout=1)
+        assert runtime._settings.data_dir == str(tmp_path / "active")
+        if reset_engines:
+            assert runtime._settings.llm_model == "replacement-model"
+            assert "source" not in manager._slots and events == ["released", "closed"]
+        else:
+            assert runtime._settings.search_top_k == 17
+            assert manager._slots["source"] is old_slot and events == ["released"]
+    finally:
+        release.set()
+        if writer_signal is not None:
+            writer_signal.cancel()
+        await asyncio.gather(execution, *([update_task] if update_task else []), return_exceptions=True)
+        if writer_signal is not None:
+            await asyncio.gather(writer_signal, return_exceptions=True)
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
 async def test_runtime_stop_preserves_replaced_app_state(tmp_path: Path) -> None:
     factory = _RuntimeFactory()
     runtime = KnowledgeRuntime(settings, object(), active_path=tmp_path, factory=factory)
@@ -380,7 +473,7 @@ async def test_runtime_stop_preserves_replaced_app_state(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_ready_waits_for_bootstrap_callback_runtime_install(monkeypatch) -> None:
+async def test_ready_waits_for_bootstrap_callback_runtime_install(monkeypatch, settings_store) -> None:
     from sag_api import main as main_module
 
     runtime = SimpleNamespace(ready=False, starts=0, stops=0)
@@ -462,7 +555,7 @@ async def test_ready_waits_for_bootstrap_callback_runtime_install(monkeypatch) -
 
 
 @pytest.mark.asyncio
-async def test_lifespan_disposes_database_after_runtime_stop_failure(monkeypatch) -> None:
+async def test_lifespan_disposes_database_after_runtime_stop_failure(monkeypatch, settings_store) -> None:
     from sag_api import main as main_module
 
     disposed = False
@@ -503,9 +596,12 @@ async def test_lifespan_disposes_database_after_runtime_stop_failure(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("verified_migration", [False, True])
 async def test_real_ready_coordinator_installs_resolved_runtime_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    verified_migration: bool,
+    settings_store,
 ) -> None:
     from sag_api import main as main_module
 
@@ -519,11 +615,30 @@ async def test_real_ready_coordinator_installs_resolved_runtime_once(
             "upload_dir": str(tmp_path / "uploads"),
         }
     )
+    engine = DataEngine(
+        build_engine_config(test_settings, overrides={"data_dir": str(active_path)}),
+        health_check=False,
+    )
+    try:
+        await engine.start()
+    finally:
+        await engine.aclose()
     layout = StorageLayout.from_settings(test_settings)
     ActiveEngineStore(layout.upgrades / "active-engine.json").activate(
         configured_path,
         active_path,
     )
+    if verified_migration:
+        BootstrapStateStore(layout.upgrades / "bootstrap.json").save(
+            BootstrapState(
+                phase=StorageBootstrapPhase.FAILED,
+                source_version="legacy_0_7",
+                target_version="0.8.2",
+                choice=StorageChoice.MIGRATE,
+                stage="verified",
+                error="temporary runtime startup failure",
+            )
+        )
     runtime = SimpleNamespace(ready=False, starts=0, stops=0, active_path=None)
 
     class Runtime:

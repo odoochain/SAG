@@ -106,20 +106,231 @@ def test_role_input_is_canonical_across_unicode_and_newlines() -> None:
     assert input_sha256(rendered) == input_sha256("Café\nTitle\n\nBody\nLine")
 
 
-def test_embedding_identity_requires_an_explicit_dimension() -> None:
-    configured = SimpleNamespace(
-        embedding_model="test/embedding",
-        effective_embedding_base_url="https://embedding.invalid/v1",
-        embedding_dimensions=3,
+def test_configured_embedding_identity_uses_the_effective_dimension() -> None:
+    """身份取配置的**生效**维度，默认配置也必须有值。
+
+    引擎资源对象（LimitedEmbeddingAdapter）不暴露模型与维度，身份只能来自配置。
+    若默认配置下取不到维度，复制/迁移导入就永远无法复用向量（每个角色都要重新
+    调用 embedding 接口），这正是修复前的行为。0.13.0 起 schema 维度恒有值
+    （未配置时默认 1024），所以「向量空间未知」这个状态已不存在。
+    """
+    from sag_api.core.config import Settings
+
+    default = configured_embedding_identity(Settings(_env_file=None))
+    assert default is not None
+    assert default["dimensions"] == 1024
+
+    explicit = configured_embedding_identity(
+        SimpleNamespace(
+            embedding_model="test/embedding",
+            effective_embedding_base_url="https://embedding.invalid/v1",
+            embedding_dimensions=3,
+        )
     )
+    assert explicit["dimensions"] == 3
+
+
+def test_configured_embedding_identity_stays_conservative_without_any_dimension() -> None:
+    """连兼容字段都没有的桩对象仍返回 None：拿不到维度就不声称认识向量空间。"""
     unknown = SimpleNamespace(
         embedding_model="test/embedding",
         effective_embedding_base_url="https://embedding.invalid/v1",
         embedding_dimensions=None,
     )
 
-    assert configured_embedding_identity(configured)["dimensions"] == 3
     assert configured_embedding_identity(unknown) is None
+
+
+def test_new_empty_source_promotes_to_known_on_first_vector_write() -> None:
+    from sag_api.core.config import Settings
+    from sag_api.sag.octx_vector_protocol import (
+        apply_vector_identity_record,
+        initialize_vector_identity_state,
+    )
+
+    identity = configured_embedding_identity(Settings(_env_file=None))
+    assert identity is not None
+    source = SimpleNamespace(
+        config=initialize_vector_identity_state({"engine": {"language": "zh"}})
+    )
+
+    assert apply_vector_identity_record(source, identity) is True
+    assert source.config["octx_vector_identity_state"] == "known"
+    assert source.config["octx_vector_identity"] == identity
+    assert source.config["engine"] == {"language": "zh"}
+
+
+def test_legacy_unknown_source_never_promotes_from_document_observations() -> None:
+    from sag_api.core.config import Settings
+    from sag_api.sag.octx_vector_protocol import apply_vector_identity_record
+
+    identity = configured_embedding_identity(Settings(_env_file=None))
+    source = SimpleNamespace(config={})
+
+    assert apply_vector_identity_record(source, identity) is True
+    assert source.config == {"octx_vector_identity_state": "mixed"}
+    assert apply_vector_identity_record(source, identity) is False
+    assert source.config == {"octx_vector_identity_state": "mixed"}
+
+
+def test_document_identities_recover_mixed_source_after_full_reprocess() -> None:
+    """A legacy source becomes reusable only after every active document is known."""
+    from sag_api.core.config import Settings
+    from sag_api.sag.octx_vector_protocol import (
+        reconcile_vector_identity_records,
+        vector_profile_from_identity,
+    )
+
+    identity = configured_embedding_identity(Settings(_env_file=None))
+    assert identity is not None
+    source = SimpleNamespace(
+        config={
+            "engine": {"language": "zh"},
+            "octx_vector_identity_state": "mixed",
+        }
+    )
+
+    assert reconcile_vector_identity_records(source, [identity, None]) is False
+    assert source.config["octx_vector_identity_state"] == "mixed"
+    assert "octx_vector_identity" not in source.config
+
+    assert reconcile_vector_identity_records(source, [identity, identity]) is True
+    assert source.config["octx_vector_identity_state"] == "known"
+    assert source.config["octx_vector_identity"] == identity
+    assert source.config["engine"] == {"language": "zh"}
+
+    profile = vector_profile_from_identity(
+        "chunk.content",
+        source.config["octx_vector_identity"],
+        int(identity["dimensions"]),
+    )
+    assert profile.get("reuse_policy", "compatible") == "compatible"
+    assert profile["model"] == identity["model"]
+    assert profile["model_fingerprint"] == identity["model_fingerprint"]
+    assert profile["fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_persisted_document_identities_recover_legacy_source_after_all_documents_reprocess() -> None:
+    """Persisting only one refreshed document must not make legacy siblings reusable."""
+    from sag_api.core.config import Settings
+    from sag_api.core.db import SessionLocal, init_db
+    from sag_api.db.models import Document, Source
+    from sag_api.enums import DocumentStatus
+    from sag_api.sag.document_vector_identity import record_document_vector_identity
+
+    await init_db()
+    identity = configured_embedding_identity(Settings(_env_file=None))
+    assert identity is not None
+    async with SessionLocal() as session:
+        source = Source(
+            name=f"legacy-vector-source-{uuid.uuid4().hex}",
+            sag_source_config_id=f"legacy-vector-config-{uuid.uuid4().hex}"[:64],
+            config={"octx_vector_identity_state": "mixed"},
+        )
+        session.add(source)
+        await session.flush()
+        first = Document(
+            source_id=source.id,
+            filename="first.md",
+            content_type="text/markdown",
+            size_bytes=1,
+            storage_path="/tmp/first.md",
+            status=DocumentStatus.READY,
+            sag_source_id="first-published-input",
+            control_revision=1,
+        )
+        second = Document(
+            source_id=source.id,
+            filename="second.md",
+            content_type="text/markdown",
+            size_bytes=1,
+            storage_path="/tmp/second.md",
+            status=DocumentStatus.READY,
+            sag_source_id="second-published-input",
+            control_revision=1,
+        )
+        session.add_all([first, second])
+        await session.flush()
+
+        await record_document_vector_identity(session, source, first, identity)
+        assert first.vector_identity == identity
+        assert source.config == {"octx_vector_identity_state": "mixed"}
+
+        await record_document_vector_identity(session, source, second, identity)
+        assert second.vector_identity == identity
+        assert source.config["octx_vector_identity_state"] == "known"
+        assert source.config["octx_vector_identity"] == identity
+
+        await session.delete(source)
+        await session.commit()
+
+
+def test_vector_identity_record_survives_an_unchanged_configuration() -> None:
+    from sag_api.core.config import Settings
+    from sag_api.sag.octx_vector_protocol import apply_vector_identity_record
+
+    identity = configured_embedding_identity(Settings(_env_file=None))
+    source = SimpleNamespace(
+        config={"octx_vector_identity": identity, "engine": {"language": "zh"}}
+    )
+
+    assert apply_vector_identity_record(source, identity) is True
+    assert source.config == {
+        "octx_vector_identity_state": "known",
+        "octx_vector_identity": identity,
+        "engine": {"language": "zh"},
+    }
+    assert apply_vector_identity_record(source, identity) is False
+
+
+def test_vector_identity_record_becomes_durably_mixed_when_configuration_changed() -> None:
+    """记录与当前身份不同，说明该来源下的向量可能来自另一种空间。
+
+    此时必须清除记录，让导出回退到 ``rebuild_required``，而不是拿新配置冒充
+    旧向量的身份（那会导致下游静默复用错向量空间的向量）。
+    """
+    from sag_api.core.config import Settings
+    from sag_api.sag.octx_vector_protocol import apply_vector_identity_record
+
+    previous = configured_embedding_identity(
+        Settings(_env_file=None, embedding_model="old/model", embedding_dimensions=1024)
+    )
+    current = configured_embedding_identity(
+        Settings(_env_file=None, embedding_model="new/model", embedding_dimensions=1024)
+    )
+    assert previous != current, "同维度但不同模型必须产生不同身份"
+
+    source = SimpleNamespace(
+        config={
+            "octx_vector_identity_state": "known",
+            "octx_vector_identity": previous,
+        }
+    )
+    assert apply_vector_identity_record(source, current) is True
+    assert source.config == {"octx_vector_identity_state": "mixed"}
+    assert apply_vector_identity_record(source, current) is False
+    assert source.config == {"octx_vector_identity_state": "mixed"}
+
+
+def test_complete_partition_replacement_overwrites_mixed_or_stale_identity() -> None:
+    from sag_api.core.config import Settings
+    from sag_api.sag.octx_vector_protocol import replace_vector_identity_record
+
+    identity = configured_embedding_identity(
+        Settings(_env_file=None, embedding_model="new/model")
+    )
+    source = SimpleNamespace(
+        config={
+            "octx": {"asset_id": "asset-1"},
+            "octx_vector_identity_state": "mixed",
+        }
+    )
+
+    assert replace_vector_identity_record(source, identity) is True
+    assert source.config["octx_vector_identity_state"] == "known"
+    assert source.config["octx_vector_identity"] == identity
+    assert source.config["octx"] == {"asset_id": "asset-1"}
 
 
 def test_embedding_identity_distinguishes_service_endpoints_without_exposing_them() -> None:
@@ -305,7 +516,15 @@ def _compatible_identity(dimensions: int) -> dict:
     )
 
 
-async def test_prepare_vector_reuse_rebuilds_role_when_dimensions_mismatch(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("configured_dimensions", "generated_vector"),
+    [(None, [0.4, 0.5, 0.6]), (2, [0.4, 0.5])],
+)
+async def test_prepare_vector_reuse_rebuilds_role_when_dimensions_are_unknown_or_mismatched(
+    tmp_path: Path,
+    configured_dimensions: int | None,
+    generated_vector: list[float],
+) -> None:
     from sag_api.sag.octx_importer import build_structured_plan
     from sag_api.sag.octx_vector_protocol import vector_profile_from_identity
 
@@ -321,20 +540,20 @@ async def test_prepare_vector_reuse_rebuilds_role_when_dimensions_mismatch(tmp_p
     plan_path = tmp_path / "dim-mismatch-plan.sqlite3"
     build_structured_plan(package, plan_path, str(uuid.uuid4()))
 
-    class TwoDimEmbedding:
+    class Embedding:
         model = "test/embedding"
         base_url = "https://embedding.invalid/v1"
-        dimensions = 2
+        dimensions = configured_dimensions
 
         def __init__(self) -> None:
             self.calls: list[list[str]] = []
 
         async def batch_generate(self, texts):
             self.calls.append(list(texts))
-            return [[0.4, 0.5] for _ in texts]
+            return [generated_vector for _ in texts]
 
-    embedding = TwoDimEmbedding()
-    # A dimension mismatch must disable reuse without crashing the import.
+    embedding = Embedding()
+    # An unknown or mismatched dimension must disable reuse without crashing the import.
     assert prepare_vector_reuse(package, plan_path, embedding) == set()
 
     from sag_api.sag.octx_vector_rebuilder import _vectors_for_role
@@ -346,8 +565,99 @@ async def test_prepare_vector_reuse_rebuilds_role_when_dimensions_mismatch(tmp_p
         embedding,
         plan_path=plan_path,
     )
-    assert regenerated == [[0.4, 0.5]]
+    assert regenerated == [generated_vector]
     assert embedding.calls == [["Head\n\nBody"]]
+
+
+async def test_prepare_vector_reuse_accepts_config_derived_identity(tmp_path: Path) -> None:
+    """回归：生产路径传入的引擎资源对象并不携带 embedding 身份。
+
+    ``engine_manager.get_sag_embedding()`` 返回的是 ``LimitedEmbeddingAdapter``，
+    它不代理 ``model`` / ``base_url`` / ``dimensions``——仅凭该对象取属性会静默
+    拿到默认值，导致 Arrow 向量复用被永久禁用且不报错（每次导入都全量重新嵌入）。
+    复用判定因此必须由调用方注入当前配置解析出的身份。
+    """
+    from sag_api.sag.octx_importer import build_structured_plan
+    from sag_api.sag.octx_vector_protocol import (
+        configured_embedding_identity,
+        vector_profile_from_identity,
+    )
+
+    chunk_id = "019c2222-2222-7222-8222-222222222222"
+    profile = vector_profile_from_identity("chunk.content", _compatible_identity(3), 3)
+    package = _compatible_reuse_package(
+        tmp_path,
+        name="config-identity",
+        profiles=[profile],
+        arrow_rows={"chunk.content": [(chunk_id, [0.1, 0.2, 0.3])]},
+    )
+    plan_path = tmp_path / "config-identity-plan.sqlite3"
+    build_structured_plan(package, plan_path, str(uuid.uuid4()))
+
+    class RuntimeAdapter:
+        """模拟引擎资源包装对象：只有生成能力，没有身份属性。"""
+
+        async def batch_generate(self, texts):  # pragma: no cover - 复用命中时不应被调用
+            raise AssertionError("reuse must not call the embedding provider")
+
+    runtime = RuntimeAdapter()
+    assert not hasattr(runtime, "dimensions")
+
+    # 旧路径：只给运行时对象——身份不可得，复用被静默禁用。
+    assert prepare_vector_reuse(package, plan_path, runtime) == set()
+
+    # 新路径：注入由当前配置解析的身份——角色可复用。
+    identity = configured_embedding_identity(
+        SimpleNamespace(
+            embedding_model="test/embedding",
+            effective_embedding_base_url="https://embedding.invalid/v1",
+            embedding_dimensions=3,
+        )
+    )
+    assert identity is not None
+    assert prepare_vector_reuse(package, plan_path, runtime, local_identity=identity) == {
+        "chunk.content"
+    }
+
+
+async def test_prepare_vector_reuse_works_for_the_default_configuration(tmp_path: Path) -> None:
+    """回归：默认配置下，双方 embedding 服务与维度一致时必须能复用向量。
+
+    修复前，默认配置解析不出身份（返回 None），导入侧于是在比较之前就跳过每个
+    角色——即使两边配置完全相同，也会全量重新调用 embedding 接口。
+    """
+    from sag_api.core.config import Settings
+    from sag_api.sag.octx_importer import build_structured_plan
+    from sag_api.sag.octx_vector_protocol import vector_profile_from_identity
+
+    settings = Settings(_env_file=None)
+    identity = configured_embedding_identity(settings)
+    assert identity is not None, "默认配置必须能解析出 embedding 身份；否则复用永不生效"
+    dimensions = int(identity["dimensions"])
+
+    chunk_id = "019c2222-2222-7222-8222-222222222222"
+    profile = vector_profile_from_identity("chunk.content", identity, dimensions)
+    assert profile.get("reuse_policy", "compatible") == "compatible"
+
+    package = _compatible_reuse_package(
+        tmp_path,
+        name="default-config",
+        profiles=[profile],
+        arrow_rows={"chunk.content": [(chunk_id, [0.0] * dimensions)]},
+        dimensions=dimensions,
+    )
+    plan_path = tmp_path / "default-config-plan.sqlite3"
+    build_structured_plan(package, plan_path, str(uuid.uuid4()))
+
+    class RuntimeAdapter:
+        """引擎资源对象形状：只有生成能力，没有身份属性。"""
+
+        async def batch_generate(self, texts):  # pragma: no cover - 复用命中时不应被调用
+            raise AssertionError("reuse must not call the embedding provider")
+
+    assert prepare_vector_reuse(
+        package, plan_path, RuntimeAdapter(), local_identity=identity
+    ) == {"chunk.content"}
 
 
 async def test_partial_coverage_role_reuses_available_rows_and_rebuilds_missing(tmp_path: Path) -> None:
@@ -668,6 +978,7 @@ async def test_lancedb_arrow_stream_exports_large_role_without_python_vector_mat
 
     import pyarrow as pa
     import pyarrow.ipc as ipc
+    from zleap.sag.core.adapters.limited import LimitedVectorStore
 
     row_count = 5001
     workspace = tmp_path / "workspace"
@@ -689,13 +1000,15 @@ async def test_lancedb_arrow_stream_exports_large_role_without_python_vector_mat
     vectors = {f"local-{index:05d}": [float(index), float(index + 1)] for index in range(row_count)}
     streamed_ids = [*vectors, "local-00000", "local-extra"]
     vectors["local-extra"] = [-1.0, -1.0]
+    predicates: list[str] = []
 
     class Query:
         def __init__(self) -> None:
             self.ids: list[str] = []
 
         def where(self, predicate: str):
-            self.ids = list(streamed_ids) if "source_config_id" in predicate else re.findall(r"'([^']+)'", predicate)
+            predicates.append(predicate)
+            self.ids = list(streamed_ids) if "data_source_id" in predicate else re.findall(r"'([^']+)'", predicate)
             return self
 
         def select(self, _fields: list[str]):
@@ -749,6 +1062,13 @@ async def test_lancedb_arrow_stream_exports_large_role_without_python_vector_mat
 
     LanceStore.__module__ = "zleap.sag.core.storage.lancedb_store"
 
+    class LanceAdapter:
+        provider = "lancedb"
+        capabilities = frozenset()
+
+        def _raw(self):
+            return LanceStore()
+
     class Embedding:
         model = "test/embedding"
         base_url = "https://embedding.invalid/v1"
@@ -768,7 +1088,7 @@ async def test_lancedb_arrow_stream_exports_large_role_without_python_vector_mat
 
     roles = await write_existing_vector_payload(
         workspace,
-        LanceStore(),
+        LimitedVectorStore(LanceAdapter(), SimpleNamespace()),
         Embedding(),
         manifest_path=manifest_path,
         routing="source-config-1",
@@ -777,6 +1097,7 @@ async def test_lancedb_arrow_stream_exports_large_role_without_python_vector_mat
 
     assert roles == {"chunk.heading"}
     assert table.query_count == 1
+    assert predicates == ["data_source_id = 'source-config-1'"]
     with pa.memory_map(str(workspace / "vectors/chunk_heading.arrow"), "r") as source:
         table = ipc.open_file(source).read_all()
     assert table.num_rows == row_count
@@ -1077,13 +1398,18 @@ async def test_write_vector_payload_creates_valid_vectors_v01_package(tmp_path: 
     shutil.copytree(workspace, unavailable_workspace)
     shutil.rmtree(unavailable_workspace / "vectors")
 
-    class UnavailableVectors:
-        async def fetch_vector_fields(self, index, ids, fields):
+    from zleap.sag.core.adapters.limited import LimitedVectorStore
+
+    class UnavailableAdapter:
+        provider = "lancedb"
+        capabilities = frozenset()
+
+        def _raw(self):
             raise ConnectionError("vector store unavailable")
 
     unavailable_roles = await write_existing_vector_payload(
         unavailable_workspace,
-        UnavailableVectors(),
+        LimitedVectorStore(UnavailableAdapter(), SimpleNamespace()),
         Embedding(),
         source_ids=source_ids,
     )

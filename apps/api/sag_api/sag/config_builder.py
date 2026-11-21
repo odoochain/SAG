@@ -13,12 +13,14 @@ from zleap.sag import EngineConfig
 from zleap.sag.config import (
     ElasticsearchVectorConfig,
     EmbeddingConfig,
+    JevConfig,
     LLMConfig,
     OceanBaseConnectionConfig,
     OceanBaseVectorConfig,
     PgVectorConfig,
     PostgresConnectionConfig,
     RelationalConfig,
+    RuntimeLimits,
 )
 from zleap.sag.core.ai.structured import StructuredOutputMode
 
@@ -104,17 +106,29 @@ def build_engine_config(settings: Settings, *, overrides: dict[str, Any] | None 
         model=settings.embedding_model,
         base_url=settings.effective_embedding_base_url,
         api_key=settings.effective_embedding_api_key or _PLACEHOLDER,
-        # 0.8.2:pgvector/oceanbase 建向量模式对象必须显式维度;SAG 默认模型
-        # bge-large-en-v1.5 为 1024 维,未配置 SAG_EMBEDDING_DIMENSIONS 时按此兜底。
-        dimensions=settings.embedding_dimensions or 1024,
+        # zleap-sag 0.13.0 起维度拆成两项：schema 维度决定向量空间与返回向量校验，
+        # 请求维度是发往 OpenAI-compatible 接口的可选参数（None = 不发送）。
+        # 旧 SAG_EMBEDDING_DIMENSIONS 同时喂给两者，见 Settings 的 effective_* 属性。
+        schema_dimensions=settings.effective_embedding_schema_dimensions,
+        request_dimensions=settings.effective_embedding_request_dimensions,
+        timeout=settings.embedding_timeout,
     )
 
     return EngineConfig(
         storage_mode="normal",
         llm=llm,
         embedding=embedding,
+        jev=(
+            JevConfig(endpoint=settings.jev_endpoint, model=settings.jev_model, api_key=settings.jev_api_key)
+            if settings.jev_endpoint
+            else None
+        ),
         relational=_build_relational(settings),
         vector=_build_vector(settings),
         data_dir=str(overrides.get("data_dir") or settings.data_dir),
         language=overrides.get("language", settings.sag_language),
+        runtime_limits=RuntimeLimits(
+            embedding_concurrency=settings.embedding_concurrency,
+            acquire_timeout_seconds=float(max(30, settings.embedding_timeout)),
+        ),
     )

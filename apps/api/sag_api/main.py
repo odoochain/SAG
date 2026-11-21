@@ -17,8 +17,9 @@ from sag_api.core.db import SessionLocal, dispose_db, init_db
 from sag_api.core.error_taxonomy import ErrorCode, ErrorLayer, ErrorStage
 from sag_api.core.errors import ApiError
 from sag_api.core.logging import RequestContextMiddleware, configure_logging, get_logger
+from sag_api.services.chatbot_service import CaptureMiddleware
 
-# [storage-bootstrap] 唯一允许的 upgrades 包入口；删除 sag_api/upgrades/ 时还原本行
+# [storage-bootstrap] 知识库重建与活动数据目录的统一入口
 from sag_api.upgrades.integration import bind_storage_bootstrap, install_storage_bootstrap_middleware
 
 log = get_logger("app")
@@ -49,7 +50,15 @@ async def lifespan(app: FastAPI):
 
     await apply_startup_overrides(SessionLocal)
 
-    # [storage-bootstrap] 引导用户迁移存量数据；删除 sag_api/upgrades/ 时连同下方 finally 中标注的两行一起还原
+    try:
+        from sag_api.services.dsh_integration_service import write_connection_file
+
+        async with SessionLocal() as session:
+            await write_connection_file(session)
+    except OSError as error:
+        log.warning("DSH 本机连接文件刷新失败：%s", error)
+
+    # [storage-bootstrap] 旧数据确认重建与现有数据目录启动；保留活动目录解析
     storage_bootstrap = bind_storage_bootstrap(app, settings, SessionLocal)
     storage_status = await storage_bootstrap.inspect()
 
@@ -101,8 +110,9 @@ def create_app() -> FastAPI:
             r")(:\d+)?"
         )
     app.add_middleware(CORSMiddleware, **cors_kwargs)
-    # [storage-bootstrap] 存储引导期间拦截未就绪请求（删除 sag_api/upgrades/ 时还原本行）
+    # [storage-bootstrap] 存储重建期间拦截未就绪请求
     install_storage_bootstrap_middleware(app)
+    app.add_middleware(CaptureMiddleware)
     # 请求追踪（放在 CORS 之后添加 → 更外层执行，最先分配 request_id）
     app.add_middleware(RequestContextMiddleware)
 
@@ -130,6 +140,9 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=500, content={"error": error})
 
     app.include_router(api_router)
+    from sag_api.client_access.standard import install as install_client_access
+
+    install_client_access(app)
 
     # 信源即 MCP：挂载 Streamable-HTTP 端点（失败不阻断应用启动）
     try:

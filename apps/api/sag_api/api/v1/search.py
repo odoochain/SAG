@@ -6,13 +6,18 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TypedDict
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from sag_api.core.config import settings
 from sag_api.core.db import get_session
-from sag_api.core.deps import get_current_user, get_engine_manager, get_llm
+from sag_api.core.deps import (
+    get_current_user,
+    get_current_user_or_connector,
+    get_engine_manager,
+    get_llm,
+)
 from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import ApiError, ValidationError
 from sag_api.core.logging import get_logger
@@ -35,6 +40,8 @@ from sag_api.schemas.search import (
 from sag_api.services.eval.llm_judge import judge_pairwise
 from sag_api.services.retrieval_service import (
     EventScoreMap,
+    event_scores_from_evidence,
+    published_document_inputs,
     recall_event_scores,
     retrieve_relevant_sections,
     stream_synthesize_search_answer,
@@ -100,16 +107,26 @@ async def _event_graph_fields(
     sources_by_config: dict[str, Source],
     *,
     event_scores: EventScoreMap | None = None,
+    evidence_events_only: bool = False,
 ) -> _EventGraphFields:
     event_scores = event_scores or {}
     if not sections and not event_scores:
         return {"events": [], "entities": [], "relations": []}
+    published = await published_document_inputs(list(sources_by_config.values()))
     graph = await engine_manager.graph_for_sections(
-        sections,
+        [] if evidence_events_only else sections,
         sources_by_config,
+        source_ids_by_config=published,
         event_limit=max(1, len(sections), len(event_scores)),
         event_scores=event_scores,
     )
+    if published != await published_document_inputs(list(sources_by_config.values())):
+        return {"events": [], "entities": [], "relations": []}
+    if evidence_events_only:
+        # Different scoring channels are not comparable. Follow the evidence
+        # order instead of letting graph hydration sort their numeric scores.
+        event_order = {key: index for index, key in enumerate(event_scores)}
+        graph.events.sort(key=lambda event: event_order[(event.source_config_id, event.id)])
     events = []
     for event in graph.events:
         source = sources_by_config.get(event.source_config_id)
@@ -146,6 +163,34 @@ async def _event_graph_fields(
     }
 
 
+async def _retrieve_search_evidence(
+    engine_manager: EngineManager,
+    sources: list[Source],
+    body: SearchRequest | GlobalSearchRequest,
+) -> tuple[SearchOutcome, EventScoreMap, bool]:
+    configuration = getattr(engine_manager, "_settings", settings)
+    strategy = body.strategy or configuration.search_strategy
+    retrieval = retrieve_relevant_sections(
+        engine_manager,
+        sources,
+        body.query,
+        strategy=strategy,
+        top_k=body.top_k,
+        include_ranked_candidates=body.include_ranked_candidates,
+    )
+    if strategy == "multi_jev":
+        outcome = await retrieval
+        return outcome, event_scores_from_evidence(outcome.sections), True
+    outcome, scores = await asyncio.gather(
+        retrieval,
+        recall_event_scores(
+            engine_manager, body.query,
+            {source.sag_source_config_id: source for source in sources}, limit=body.top_k,
+        ),
+    )
+    return outcome, scores, False
+
+
 @dataclass(slots=True)
 class _PreparedGlobalSearch:
     sources: list[Source]
@@ -173,32 +218,23 @@ async def _prepare_global_search(
         )
 
     refs = {source.sag_source_config_id: source for source in sources}
-    outcome, event_scores = await asyncio.gather(
-        retrieve_relevant_sections(
-            engine_manager,
-            sources,
-            body.query,
-            strategy=body.strategy,
-            top_k=body.top_k,
-        ),
-        recall_event_scores(
-            engine_manager,
-            body.query,
-            refs,
-            limit=body.top_k,
-        ),
-    )
+    published = await published_document_inputs(sources)
+    outcome, event_scores, is_jev = await _retrieve_search_evidence(engine_manager, sources, body)
     graph_fields = await _event_graph_fields(
         engine_manager,
         outcome.sections,
         refs,
         event_scores=event_scores,
+        evidence_events_only=is_jev,
     )
+    if published != await published_document_inputs(sources):
+        outcome = outcome.model_copy(update={"sections": []})
+        graph_fields = {"events": [], "entities": [], "relations": []}
     stats = {
         **outcome.stats,
         "event_candidates": len(event_scores),
         "event_hits": len(graph_fields["events"]),
-        "event_recall": "vector+chunk" if event_scores else "chunk",
+        "event_recall": "ranked_evidence" if is_jev else "vector+chunk" if event_scores else "chunk",
     }
 
     section_outputs = []
@@ -281,21 +317,8 @@ async def search(
 ) -> SearchResponse:
     source = await get_source(session, source_id)
     refs = {source.sag_source_config_id: source}
-    outcome, event_scores = await asyncio.gather(
-        retrieve_relevant_sections(
-            engine_manager,
-            [source],
-            body.query,
-            strategy=body.strategy,
-            top_k=body.top_k,
-        ),
-        recall_event_scores(
-            engine_manager,
-            body.query,
-            refs,
-            limit=body.top_k,
-        ),
-    )
+    published = await published_document_inputs([source])
+    outcome, event_scores, is_jev = await _retrieve_search_evidence(engine_manager, [source], body)
     for section in outcome.sections:
         section.source_config_id = section.source_config_id or source.sag_source_config_id
     graph_fields = await _event_graph_fields(
@@ -303,7 +326,11 @@ async def search(
         outcome.sections,
         refs,
         event_scores=event_scores,
+        evidence_events_only=is_jev,
     )
+    if published != await published_document_inputs([source]):
+        outcome = outcome.model_copy(update={"sections": []})
+        graph_fields = {"events": [], "entities": [], "relations": []}
     # 对外 source_id = sag 信源 id（可路由 / 取原文），不泄漏引擎内部 id
     return SearchResponse(
         query=outcome.query,
@@ -321,21 +348,26 @@ async def search(
             **outcome.stats,
             "event_candidates": len(event_scores),
             "event_hits": len(graph_fields["events"]),
-            "event_recall": "vector+chunk" if event_scores else "chunk",
+            "event_recall": "ranked_evidence" if is_jev else "vector+chunk" if event_scores else "chunk",
         },
     )
 
 
 @global_router.post("", response_model=SearchResponse)
 async def global_search(
+    request: Request,
     body: GlobalSearchRequest,
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(get_current_user_or_connector),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
     llm: LLMClient = Depends(get_llm),
 ) -> SearchResponse:
-    """全局搜索：先选有界信源分区，再 fan-out 检索并返回可追溯结果。"""
+    """全局搜索；connector 只返回结构化证据，JWT 可生成摘要并保存探索。"""
     prepared = await _prepare_global_search(session, engine_manager, body)
+    if request.state.auth_kind == "connector":
+        return prepared.response.model_copy(
+            update={"summary": "", "exploration_id": None},
+        )
     summary = await synthesize_search_answer(
         prepared.outcome.query,
         prepared.outcome.sections,
@@ -392,7 +424,7 @@ async def global_search_stream(
             raise
         except ApiError as error:
             log.warning("搜索流异常终止：%s", error.message)
-            yield _sse("error", {"code": error.code, "message": error.message})
+            yield _sse("error", error.to_envelope()["error"])
         except Exception as error:  # noqa: BLE001
             log.exception("搜索流未处理异常：%s", error)
             yield _sse(
@@ -413,6 +445,7 @@ async def _run_one_strategy(
     strategy: str,
     top_k: int | None,
     source_refs: dict[str, Source],
+    include_ranked_candidates: bool = False,
 ) -> EvalStrategyResultOut:
     """一次跑一个策略,任何失败都吸掉转成 error 字段,不让 gather 把整个对比搞崩。"""
     try:
@@ -422,6 +455,7 @@ async def _run_one_strategy(
             query,
             strategy=strategy,
             top_k=top_k,
+            include_ranked_candidates=include_ranked_candidates,
         )
     except Exception as error:  # noqa: BLE001
         log.warning("eval-compare 策略 %s 失败:%s", strategy, error)
@@ -503,6 +537,7 @@ async def eval_compare(
                 strategy,
                 body.top_k,
                 source_refs,
+                body.include_ranked_candidates,
             )
             for strategy in ordered_strategies
         )
@@ -523,9 +558,7 @@ async def eval_compare(
 
     judges: list[EvalJudgeOut] = []
     if judge_enabled:
-        raw_by_strategy = {
-            result.strategy: result for result in results if result.error is None
-        }
+        raw_by_strategy = {result.strategy: result for result in results if result.error is None}
         pairs: list[tuple[str, str]] = []
         for a_index, a in enumerate(ordered_strategies):
             for b in ordered_strategies[a_index + 1 :]:
@@ -533,14 +566,8 @@ async def eval_compare(
                     pairs.append((a, b))
 
         async def one_pair(a: str, b: str) -> EvalJudgeOut | None:
-            a_sections = [
-                RetrievedSection(**section.model_dump())
-                for section in raw_by_strategy[a].sections
-            ]
-            b_sections = [
-                RetrievedSection(**section.model_dump())
-                for section in raw_by_strategy[b].sections
-            ]
+            a_sections = [RetrievedSection(**section.model_dump()) for section in raw_by_strategy[a].sections]
+            b_sections = [RetrievedSection(**section.model_dump()) for section in raw_by_strategy[b].sections]
             verdict = await judge_pairwise(
                 llm,
                 body.query,

@@ -6,6 +6,8 @@ import uuid
 import httpx
 import pytest
 
+from tests.test_dsh_integration import _draining_app_lifespan
+
 
 @pytest.mark.asyncio
 async def test_entity_read_path():
@@ -15,11 +17,9 @@ async def test_entity_read_path():
     from sag_api.main import app
 
     transport = httpx.ASGITransport(app=app)
-    async with app.router.lifespan_context(app):
+    async with _draining_app_lifespan(app):
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-            _reg = await c.post(
-                "/api/v1/auth/register", json={"email": "book@x.com", "password": "password123"}
-            )
+            _reg = await c.post("/api/v1/auth/register", json={"email": "book@x.com", "password": "password123"})
             assert _reg.status_code == 201, _reg.text
             tok = _reg.json()["access_token"]
             H = {"Authorization": f"Bearer {tok}"}
@@ -204,6 +204,7 @@ async def test_entity_read_path():
                     )
                 ],
                 {scid: source},
+                source_ids_by_config={scid: ("d1",)},
             )
             assert search_graph.events[0].title == "过五关斩六将"
             assert search_graph.events[0].summary.startswith("关羽千里走单骑")
@@ -223,6 +224,7 @@ async def test_entity_read_path():
                     )
                 ],
                 {scid: source},
+                source_ids_by_config={scid: ("d1",)},
                 event_scores={(scid, hidden_event_id): 0.97},
             )
             assert direct_event_graph.events[0].title == "桃园结义"
@@ -243,7 +245,8 @@ async def test_entity_read_path():
                 f"/api/v1/sources/{sid}/documents/{document_id}",
                 headers=H,
             )
-            assert deleted.status_code == 200
+            assert deleted.status_code == 202
+            assert deleted.json()["type"] == "delete_document"
             for _ in range(40):
                 document_response = await c.get(
                     f"/api/v1/sources/{sid}/documents/{document_id}",

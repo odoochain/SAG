@@ -9,7 +9,6 @@ import { ApiError } from "@/lib/api";
 import { getDiagnosticsStore } from "@/lib/diagnostics";
 import {
   deriveDocumentActivity,
-  documentActivityShowsProgress,
   type DocumentAction,
   type DocumentActivity,
 } from "@/lib/document-activity";
@@ -19,8 +18,9 @@ import { hasRecordedTokenUsage } from "@/lib/document-metadata";
 import { documentParserStatus } from "@/lib/document-parser-status";
 import { useDetailPanel } from "@/components/features/detail-panel";
 import { useApp } from "@/components/features/app-shell";
-import { DocumentActivityBadge } from "@/components/features/status-badge";
+import { DocumentProcessingBadge, DocumentProcessingProgress } from "@/components/features/document-processing-progress";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { useOctxExports } from "@/components/features/octx-export-provider";
 
 export function DocumentList({
@@ -36,7 +36,7 @@ export function DocumentList({
   sourceName: string;
   documents: Doc[];
   activities: Record<string, DocumentActivity>;
-  onAction: (document: Doc, action: DocumentAction) => Promise<boolean>;
+  onAction: (document: Doc, action: DocumentAction, confirmationToken?: string) => Promise<boolean>;
   variant?: "normal" | "compact";
   onOpenDocument?: (document: Doc) => void;
 }) {
@@ -46,11 +46,14 @@ export function DocumentList({
   const { timezone } = useApp();
   const { startDocumentExport, isSourceExporting } = useOctxExports();
   const exportRunning = isSourceExporting(sourceId);
+  const [restart, setRestart] = React.useState<{ document: Doc; token: string; reason?: string } | null>(null);
 
-  async function perform(document: Doc, action: DocumentAction) {
+  React.useEffect(() => setRestart(null), [sourceId]);
+
+  async function perform(document: Doc, action: DocumentAction, confirmationToken?: string): Promise<boolean> {
     try {
-      const applied = await onAction(document, action);
-      if (!applied) return;
+      const applied = await onAction(document, action, confirmationToken);
+      if (!applied) return false;
       if (action === "reprocess") toast.success(t("requeued"));
       else if (action === "pause") toast.success(t("pausing"));
       else if (action === "resume") toast.success(t("resumed"));
@@ -64,7 +67,12 @@ export function DocumentList({
         chunk_count: document.chunk_count,
         event_count: document.event_count,
       });
+      return true;
     } catch (error) {
+      if (error instanceof ApiError && error.code === "document_restart_required" && error.confirmationToken) {
+        setRestart({ document, token: error.confirmationToken, reason: error.restartReason });
+        return false;
+      }
       const fallback =
         action === "delete"
           ? t("deleteFailed")
@@ -81,10 +89,12 @@ export function DocumentList({
         filename: document.filename,
         error_message: error instanceof ApiError ? error.message : String(error),
       });
+      return false;
     }
   }
 
   function openDocument(document: Doc) {
+    if (document.status === "deleting" || document.status === "delete_failed") return;
     if (onOpenDocument) onOpenDocument(document);
     else open({ kind: "document", sourceId, documentId: document.id });
   }
@@ -93,13 +103,13 @@ export function DocumentList({
     const buttonClass = compact ? "size-7" : undefined;
     return (
       <div className="flex shrink-0 items-center gap-0.5">
-        {document.status === "ready" && (
+        {document.has_publication && (
           <Button
             variant="ghost"
             size="icon"
             className={buttonClass}
             title={t("exportOctx")}
-            disabled={activity.busy || exportRunning}
+            disabled={exportRunning || document.status === "deleting" || document.status === "delete_failed" || activity.phase === "deleting"}
             onClick={() =>
               void startDocumentExport(
                 sourceId,
@@ -118,7 +128,7 @@ export function DocumentList({
             size="icon"
             className={buttonClass}
             title={t("pause")}
-            disabled={activity.busy}
+            disabled={!activity.canPause}
             onClick={() => void perform(document, "pause")}
           >
             <Pause className="size-4" />
@@ -152,7 +162,7 @@ export function DocumentList({
           variant="ghost"
           size="icon"
           className={`${buttonClass ?? ""} text-muted-foreground hover:text-destructive`}
-          title={t("delete")}
+          title={t(document.status === "deleting" || document.status === "delete_failed" ? "continueDelete" : "delete")}
           disabled={!activity.canDelete}
           onClick={() => void perform(document, "delete")}
         >
@@ -162,12 +172,26 @@ export function DocumentList({
     );
   }
 
+  const restartDialog = <ConfirmDialog
+    open={restart !== null}
+    onOpenChange={(opened) => { if (!opened) setRestart(null); }}
+    title={t("restartTitle")}
+    description={t(
+      restart?.reason === "confirmation_target_changed" || restart?.reason === "confirmation_expired"
+        ? "restartChangedDescription" : "restartDescription",
+    )}
+    confirmLabel={t("restartConfirm")}
+    onConfirm={() => restart ? perform(restart.document, "reprocess", restart.token) : false}
+    destructive={false}
+  />;
+
   if (variant === "compact") {
     return (
+      <>
+      {restartDialog}
       <div className="space-y-0.5">
         {documents.map((document) => {
           const activity = activities[document.id] ?? deriveDocumentActivity(document);
-          const showProgress = documentActivityShowsProgress(activity.phase);
           const parser = documentParserStatus(document);
           return (
             <div
@@ -177,6 +201,7 @@ export function DocumentList({
               <button
                 type="button"
                 onClick={() => openDocument(document)}
+                disabled={document.status === "deleting" || document.status === "delete_failed"}
                 className="flex min-w-0 flex-1 items-center gap-3 rounded-lg px-1.5 py-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 title={t("viewDocument")}
               >
@@ -191,8 +216,6 @@ export function DocumentList({
                     <span>{formatBytes(document.size_bytes, locale)}</span>
                     <span>·</span>
                     <span>{relativeTime(document.created_at, timezone, locale)}</span>
-                    <span>·</span>
-                    <span>{activity.progress}%</span>
                     {hasRecordedTokenUsage(document.token_usage) && (
                       <>
                         <span>·</span>
@@ -214,30 +237,25 @@ export function DocumentList({
                       {activity.error}
                     </p>
                   )}
-                  {showProgress && (
-                    <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-muted">
-                      <div
-                        className="h-full rounded-full bg-primary/60 transition-[width] duration-300"
-                        style={{ width: `${activity.progress}%` }}
-                      />
-                    </div>
-                  )}
+                  <DocumentProcessingProgress document={document} activity={activity} compact />
                 </div>
-                <DocumentActivityBadge phase={activity.phase} />
+                <DocumentProcessingBadge document={document} activity={activity} />
               </button>
               {actions(document, activity, true)}
             </div>
           );
         })}
       </div>
+      </>
     );
   }
 
   return (
+    <>
+    {restartDialog}
     <div className="overflow-hidden rounded-lg border bg-card">
       {documents.map((document, index) => {
         const activity = activities[document.id] ?? deriveDocumentActivity(document);
-        const showProgress = documentActivityShowsProgress(activity.phase);
         const parser = documentParserStatus(document);
         return (
           <div
@@ -253,6 +271,7 @@ export function DocumentList({
             <button
               type="button"
               onClick={() => openDocument(document)}
+              disabled={document.status === "deleting" || document.status === "delete_failed"}
               className="min-w-0 flex-1 rounded-md text-left outline-none focus-visible:bg-muted/60"
               title={t("viewDetails")}
             >
@@ -263,7 +282,7 @@ export function DocumentList({
                 <span>{formatBytes(document.size_bytes, locale)}</span>
                 <span>·</span>
                 <span>{relativeTime(document.created_at, timezone, locale)}</span>
-                {document.status === "ready" && (
+                {document.has_publication && (
                   <>
                     <span>·</span>
                     <span>
@@ -274,13 +293,9 @@ export function DocumentList({
                     </span>
                   </>
                 )}
-                <span>·</span>
-                <span>
-                  {activity.progress}%
-                  {hasRecordedTokenUsage(document.token_usage) && (
-                    <> · {t("tokens", { count: formatTokenCount(document.token_usage, locale) })}</>
-                  )}
-                </span>
+                {hasRecordedTokenUsage(document.token_usage) && (
+                  <><span>·</span><span>{t("tokens", { count: formatTokenCount(document.token_usage, locale) })}</span></>
+                )}
                 {activity.error && (
                   <>
                     <span>·</span>
@@ -299,20 +314,14 @@ export function DocumentList({
                   {parser.progressKey ? ` · ${t(`parser.${parser.progressKey}`)}` : ""}
                 </div>
               )}
-              {showProgress && (
-                <div className="mt-1.5 h-1 w-full max-w-56 overflow-hidden rounded-full bg-muted">
-                  <div
-                    className="h-full rounded-full bg-primary/60 transition-[width] duration-300"
-                    style={{ width: `${activity.progress}%` }}
-                  />
-                </div>
-              )}
+              <DocumentProcessingProgress document={document} activity={activity} />
             </button>
-            <DocumentActivityBadge phase={activity.phase} />
+            <DocumentProcessingBadge document={document} activity={activity} />
             {actions(document, activity)}
           </div>
         );
       })}
     </div>
+    </>
   );
 }

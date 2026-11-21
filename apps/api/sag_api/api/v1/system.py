@@ -1,38 +1,166 @@
 from __future__ import annotations
 
+from functools import lru_cache
+from ipaddress import ip_address
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sag_api.api.v1.chatbot import SecretSafeRoute
 from sag_api.core.config import settings
 from sag_api.core.db import SessionLocal, get_session
-from sag_api.core.deps import get_current_user
-from sag_api.core.errors import ApiError, ConflictError
+from sag_api.core.deps import get_current_user, get_current_user_or_connector
+from sag_api.core.errors import ApiError, ConflictError, ForbiddenError
 from sag_api.core.logging import get_logger
 from sag_api.core.model_providers import model_provider_catalog
 from sag_api.db.models import Source, User
 from sag_api.generation import LLMClient
 from sag_api.mcp.server import MCP_TOOL_DETAILS, MCP_TOOL_NAMES
 from sag_api.sag.engine_manager import EngineManager
+from sag_api.sag.jev_probe import probe_jev_connection
+from sag_api.schemas.dsh_integration import (
+    DshCapabilityDescriptor,
+    DshConnectionDescriptor,
+    DshIntegrationUpdate,
+    DshUploadCapability,
+)
 from sag_api.schemas.system import (
+    DeepSeekQuickModelSetupRequest,
     ModelConfigUpdate,
     QuickModelSetupRequest,
     SystemPreferencesUpdate,
 )
-from sag_api.services import settings_service
+from sag_api.services import dsh_integration_service, settings_service
 
 router = APIRouter(prefix="/system", tags=["system"])
+_model_config_router = APIRouter(route_class=SecretSafeRoute)
 log = get_logger("system")
 
+DSH_CAPABILITIES = (
+    "sources.list",
+    "sources.create",
+    "knowledge.search",
+    "knowledge.read",
+    "documents.list",
+    "documents.get",
+    "documents.upload",
+    "documents.ingest",
+    "documents.reprocess",
+    "documents.delete",
+)
 
-def _capabilities() -> dict:
+
+def _request_is_loopback(request: Request) -> bool:
+    """Return whether the ASGI peer is a loopback address."""
+    if request.client is None:
+        return False
+    try:
+        return ip_address(request.client.host).is_loopback
+    except ValueError:
+        return False
+
+
+def _request_targets_loopback(request: Request) -> bool:
+    """Return whether the request targets a loopback HTTP origin."""
+    hostname = request.url.hostname
+    if hostname is None:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+@lru_cache(maxsize=1)
+def _docker_gateway_address() -> str | None:
+    """Return the Linux default-route gateway used for host-to-container traffic."""
+    try:
+        routes = Path("/proc/net/route").read_text(encoding="ascii").splitlines()
+    except OSError:
+        return None
+    for route in routes[1:]:
+        fields = route.split()
+        if len(fields) < 3 or fields[1] != "00000000":
+            continue
+        try:
+            gateway = int.from_bytes(bytes.fromhex(fields[2]), byteorder="little")
+            return str(ip_address(gateway))
+        except ValueError:
+            continue
+    return None
+
+
+def _discovery_binding_is_loopback() -> bool:
+    """Return whether Docker publishes the API only on the host loopback."""
+    try:
+        return ip_address(settings.dsh_local_discovery_bind_address).is_loopback
+    except ValueError:
+        return False
+
+
+def _request_can_discover_dsh(request: Request) -> bool:
+    """Allow direct loopback peers or explicit local-container discovery."""
+    if _request_is_loopback(request):
+        return True
+    if request.client is None:
+        return False
+    return (
+        settings.dsh_local_discovery
+        and _discovery_binding_is_loopback()
+        and request.client.host == _docker_gateway_address()
+        and _request_targets_loopback(request)
+    )
+
+
+def _dsh_urls(request: Request) -> tuple[str, str]:
+    """Build HTTP connection URLs from the address the caller actually used."""
+    base_url = str(request.base_url).rstrip("/")
+    return f"{base_url}/api/v1", f"{base_url}/mcp/"
+
+
+def _dsh_capability_descriptor(state: dsh_integration_service.DshIntegrationState) -> DshCapabilityDescriptor:
+    """Project persisted source selection without exposing the connector credential."""
+    return DshCapabilityDescriptor(
+        capabilities=list(DSH_CAPABILITIES),
+        upload=DshUploadCapability(
+            maxMb=settings.max_upload_mb,
+            extensions=sorted(extension.lstrip(".") for extension in settings.allowed_upload_exts),
+        ),
+        defaultSourceId=state.default_source_id,
+    )
+
+
+def _dsh_connection_descriptor(
+    request: Request,
+    state: dsh_integration_service.DshIntegrationState,
+) -> DshConnectionDescriptor:
+    """Build a directly usable descriptor for the current HTTP origin."""
+    api_url, mcp_url = _dsh_urls(request)
+    return DshConnectionDescriptor(
+        name="SAG 知识库",
+        apiUrl=api_url,
+        mcpUrl=mcp_url,
+        accessToken=state.token,
+        defaultSourceId=state.default_source_id,
+    )
+
+
+def _capabilities(*, current: bool = False) -> dict:
+    from sag_api.services.chatbot_service import manager, operation
+
+    snapshot = None if current else operation.get()
+    active = (snapshot or manager.snapshot()).settings
     strategy_report = EngineManager.strategies_capability_report(settings)
     return {
-        "llm_configured": settings.llm_configured,
-        "llm_provider": settings.llm_provider,
-        "llm_model": settings.llm_model,
-        "context_window": settings.llm_context_window,
+        "llm_configured": active.llm_configured,
+        "llm_provider": active.llm_provider,
+        "llm_model": active.llm_model,
+        "context_window": active.llm_context_window,
         "embedding_model": settings.embedding_model,
         "document_parser": settings.document_parser,
         "effective_document_parser": settings.effective_document_parser,
@@ -78,6 +206,68 @@ async def ready(request: Request) -> JSONResponse:
 async def capabilities() -> dict:
     """能力探测：供前端判断是否已配置 LLM、当前引擎后端等。"""
     return _capabilities()
+
+
+@router.get("/dsh", response_model=DshCapabilityDescriptor)
+async def dsh_capabilities(
+    _user: User = Depends(get_current_user_or_connector),
+    session: AsyncSession = Depends(get_session),
+) -> DshCapabilityDescriptor:
+    """Return connector capabilities without exposing its credential."""
+    state = await dsh_integration_service.get_or_create_state(session)
+    return _dsh_capability_descriptor(state)
+
+
+@router.get("/dsh-connection", response_model=DshConnectionDescriptor)
+async def discover_dsh_connection(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> DshConnectionDescriptor:
+    """Return the local connector credential only to a loopback peer."""
+    if not _request_can_discover_dsh(request):
+        raise ForbiddenError("仅允许本机访问 DSH 连接配置")
+    state = await dsh_integration_service.get_or_create_state(session)
+    return _dsh_connection_descriptor(request, state)
+
+
+@router.get("/dsh/export")
+async def export_dsh_connection(
+    request: Request,
+    _user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Download the connector descriptor after normal SAG authentication."""
+    state = await dsh_integration_service.get_or_create_state(session)
+    descriptor = _dsh_connection_descriptor(request, state)
+    return Response(
+        content=descriptor.model_dump_json(),
+        media_type="application/json",
+        headers={"Content-Disposition": 'attachment; filename="sag-dsh.json"'},
+    )
+
+
+@router.put("/dsh/settings", response_model=DshCapabilityDescriptor)
+async def update_dsh_settings(
+    body: DshIntegrationUpdate,
+    _user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> DshCapabilityDescriptor:
+    """Select the source used by DSH when a request omits one."""
+    state = await dsh_integration_service.update_default_source_and_publish(
+        session,
+        body.default_source_id,
+    )
+    return _dsh_capability_descriptor(state)
+
+
+@router.post("/dsh/regenerate", response_model=DshCapabilityDescriptor)
+async def regenerate_dsh_connection_token(
+    _user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> DshCapabilityDescriptor:
+    """Rotate the connector credential without returning the new secret."""
+    state = await dsh_integration_service.regenerate_token_and_publish(session)
+    return _dsh_capability_descriptor(state)
 
 
 @router.get("/model-config")
@@ -165,17 +355,40 @@ async def quick_setup_302(
     _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """只接收一个 302.AI Key，写入生成、向量、MinerU 与检索预设。"""
+    """首次配置 302 生成、MinerU、检索预设和所选的向量连接。"""
     status = await settings_service.model_setup_status(session)
     if not status["required"]:
         raise ConflictError("模型配置已存在，请在设置中修改")
 
-    config = await settings_service.save_302_quick_setup(session, body.api_key)
+    config = await settings_service.save_302_quick_setup(
+        session, body.api_key, body.embedding_api_key or body.api_key, body.embedding_provider
+    )
     await request.app.state.knowledge_runtime.apply_settings(settings, reset_engines=True)
-    return {"config": config, "capabilities": _capabilities()}
+    return {"config": config, "capabilities": _capabilities(current=True)}
 
 
-@router.put("/model-config")
+@router.post("/model-setup/deepseek")
+async def quick_setup_deepseek(
+    body: DeepSeekQuickModelSetupRequest,
+    request: Request,
+    _user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """首次配置官方 DeepSeek 与独立的向量连接；保留解析设置。"""
+    status = await settings_service.model_setup_status(session)
+    if not status["required"]:
+        raise ConflictError("模型配置已存在，请在设置中修改")
+    if settings.lock_llm_config:
+        raise ConflictError("生成模型配置已锁定，请通过部署环境配置")
+
+    config = await settings_service.save_deepseek_quick_setup(
+        session, body.api_key, body.embedding_api_key, body.embedding_provider
+    )
+    await request.app.state.knowledge_runtime.apply_settings(settings, reset_engines=True)
+    return {"config": config, "capabilities": _capabilities(current=True)}
+
+
+@_model_config_router.put("/model-config")
 async def update_model_config(
     body: ModelConfigUpdate,
     request: Request,
@@ -185,29 +398,46 @@ async def update_model_config(
     """保存运行期配置；仅在模型/向量配置实际变化时安全重建引擎。"""
     patch = body.model_dump(exclude_unset=True)
     before = settings_service.effective_model_config()
+    before_embedding_dimensions = (
+        settings.effective_embedding_schema_dimensions,
+        settings.effective_embedding_request_dimensions,
+    )
     config = await settings_service.save_model_config(session, patch)
 
     # 解析器/检索参数保存无需打断暖引擎；只有引擎配置真的变化才安全重建。
     engine_fields = {
         "llm_provider",
+        "llm_responses_provider",
+        "llm_responses_endpoint",
+        "llm_responses_api_version",
+        "llm_responses_send_temperature",
         "llm_base_url",
         "llm_model",
         "llm_temperature",
         "llm_max_tokens",
         "llm_timeout_ms",
         "llm_max_retries",
+        "llm_structured_output_mode",
         "embedding_model",
         "embedding_base_url",
-        "embedding_dimensions",
+        "jev_endpoint",
+        "jev_model",
         "sag_language",
     }
     engine_changed = any(before.get(key) != config.get(key) for key in engine_fields)
+    # The public alias only exposes schema dimensions; a legacy split request
+    # policy can change while that alias stays equal (or the reverse on clear).
+    engine_changed = engine_changed or before_embedding_dimensions != (
+        settings.effective_embedding_schema_dimensions,
+        settings.effective_embedding_request_dimensions,
+    )
     engine_changed = engine_changed or bool(patch.get("llm_api_key") or patch.get("embedding_api_key"))
+    engine_changed = engine_changed or bool(patch.get("jev_api_key"))
     await request.app.state.knowledge_runtime.apply_settings(
         settings,
         reset_engines=engine_changed,
     )
-    return {"config": config, "capabilities": _capabilities()}
+    return {"config": config, "capabilities": _capabilities(current=True)}
 
 
 @router.post("/model-config/mineru/302")
@@ -219,10 +449,10 @@ async def configure_302_mineru(
     """已有 302 LLM/Embedding 用户一键复用服务端保存的 Key 启用 MinerU。"""
     config = await settings_service.save_302_mineru_setup(session)
     await request.app.state.knowledge_runtime.apply_settings(settings, reset_engines=False)
-    return {"config": config, "capabilities": _capabilities()}
+    return {"config": config, "capabilities": _capabilities(current=True)}
 
 
-@router.post("/model-config/test")
+@_model_config_router.post("/model-config/test")
 async def test_model_config(
     request: Request,
     body: ModelConfigUpdate | None = None,
@@ -232,7 +462,7 @@ async def test_model_config(
     llm: LLMClient
     active = settings
     if body is None:
-        llm = request.app.state.llm
+        llm = LLMClient(settings)
     else:
         patch = body.model_dump(exclude_unset=True)
         updates = {
@@ -241,16 +471,68 @@ async def test_model_config(
             if not (key == "llm_api_key" and not value)
         }
         active = settings.model_copy(update=updates)
+        if (active.llm_provider == "responses" or settings.llm_provider == "responses") and not patch.get(
+            "llm_api_key"
+        ):
+            if (active.llm_provider, active.llm_responses_provider, active.llm_responses_endpoint) != (
+                settings.llm_provider,
+                settings.llm_responses_provider,
+                settings.llm_responses_endpoint,
+            ):
+                active.llm_api_key = None
+        if active.llm_provider == "responses":
+            try:
+                active = type(settings).model_validate(active.model_dump())
+            except ValueError:
+                return {
+                    "ok": False,
+                    "message": "Invalid Responses configuration; check endpoint, API version and reasoning options",
+                }
         llm = LLMClient(active)
     if not llm.configured:
         return {"ok": False, "message": "尚未配置 API Key"}
+    completion = {"ok": False}
+    structured = {"ok": False, "mode": active.llm_structured_output_mode}
     try:
         await llm.complete([{"role": "user", "content": "ping"}])
+        completion["ok"] = True
+        await llm.probe_structured()
+        structured["ok"] = True
         return {
             "ok": True,
             "message": f"连接成功 · {active.llm_provider} / {active.llm_model}",
+            "completion": completion, "structured": structured,
         }
-    except ApiError as e:
-        return {"ok": False, "message": e.message}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "message": str(e)}
+    except ApiError as error:
+        code = error.code
+    except Exception:  # noqa: BLE001 -- provider exceptions may contain credentials.
+        code = "llm_unavailable"
+    messages = {
+        "llm_auth_error": "Generation authentication failed; check API key and model permissions",
+        "llm_bad_request": "Generation request rejected; check provider, endpoint, model and structured output mode",
+        "llm_unavailable": "Generation service unavailable; check endpoint, rate limits and server availability",
+    }
+    return {
+        "ok": False, "problem_code": code,
+        "message": messages.get(code, "Generation response failed local validation or connection testing"),
+        "completion": completion, "structured": structured,
+    }
+
+
+@_model_config_router.post("/model-config/jev/test")
+async def test_jev_model_config(
+    body: ModelConfigUpdate,
+    _user: User = Depends(get_current_user),
+) -> dict:
+    """Check a JEV draft with synthetic evidence, without changing saved/runtime settings."""
+    patch = body.model_dump(exclude_unset=True)
+    updates = {key: value for key, value in patch.items() if key.startswith("jev_")}
+    if not updates.get("jev_api_key"):
+        updates.pop("jev_api_key", None)
+        if updates.get("jev_endpoint", settings.jev_endpoint) != settings.jev_endpoint:
+            updates["jev_api_key"] = None
+    active = type(settings).model_validate({**settings.model_dump(), **updates})
+    return (await probe_jev_connection(active)).model_dump()
+
+
+router.include_router(_model_config_router)
